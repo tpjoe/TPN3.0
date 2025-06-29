@@ -45,6 +45,9 @@ def bce(treatment_pred, current_treatments, mode, weights=None):
         return F.cross_entropy(treatment_pred.permute(0, 2, 1), current_treatments.permute(0, 2, 1), reduce=False, weight=weights)
     elif mode == 'multilabel':
         return F.binary_cross_entropy_with_logits(treatment_pred, current_treatments, reduce=False, weight=weights).mean(dim=-1)
+    elif mode == 'continuous':
+        # For continuous treatments, use MSE loss
+        return F.mse_loss(treatment_pred, current_treatments, reduction='none').mean(dim=-1)
     else:
         raise NotImplementedError()
 

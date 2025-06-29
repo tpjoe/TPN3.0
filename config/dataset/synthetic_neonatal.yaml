@@ -1,0 +1,94 @@
+# @package _global_
+dataset:
+  _target_: src.data.synthetic_neonatal.SyntheticNeonatalDatasetCollection   # Will be dynamically instantiated
+  name: synthetic_neonatal
+  path: data/processed/autoregressive.csv
+  seed: ${exp.seed}
+  min_seq_length: 0   # Lower than 15 to include all sequences
+  max_seq_length: 80
+  projection_horizon: 5
+  cf_seq_mode: sliding_treatment
+  val_batch_size: 512
+  treatment_mode: continuous   # Changed from multiclass to continuous
+  
+  # Column specifications
+  vital_columns:
+    - 'Alb_lab_value'
+    - 'Ca_lab_value'
+    - 'Cl_lab_value'
+    - 'CO2_lab_value'
+    - 'Glu_lab_value'
+    - 'K_lab_value'
+    - 'Mg_lab_value'
+    - 'Na_lab_value'
+    - 'PO4_lab_value'
+    - 'BUN_lab_value'
+    - 'Cr_lab_value'
+    - 'Tri_lab_value'
+    - 'ALKP_lab_value'
+    - 'ALT_lab_value'
+    - 'AST_lab_value'
+    - 'CaI_lab_value'
+    - 'day_since_birth'
+    - 'FluidDose'
+    - 'EnteralDose'
+    - 'days_on_TPN'
+    - 'TPNDose'
+    - 'TPNHours'
+    - 'ProtocolName_NEONATAL'
+    - 'LineID_2'
+    - 'FatProduct_SMOFlipid 20%'
+    - 'FatProduct_Intralipid 20%'
+    - 'FatProduct_Omegaven 10%'
+  
+  static_columns:
+    - 'gest_age'
+    - 'bw'
+    - 'gender_concept_id_8507'
+    - 'gender_concept_id_8532'
+    - 'race_concept_id_8515'
+    - 'race_concept_id_8516'
+    - 'race_concept_id_8527'
+    - 'race_concept_id_8557'
+    - 'race_concept_id_8657'
+  
+  # Multiple treatment columns for continuous treatments
+  treatment_columns:
+    - 'FatDose'
+    - 'AADose'
+    - 'DexDose'
+    - 'Acetate'
+    - 'Calcium'
+    - 'Copper'
+    - 'Famotidine'
+    - 'Levocar'
+    - 'Magnesium'
+    - 'MVITotal'
+    - 'Phosphate'
+    - 'Potassium'
+    # - 'Selenium'  # Removed: has zero variance (constant value)
+    - 'Sodium'
+    - 'Zinc'
+    - 'Chloride'
+    - 'GIR'
+  
+  outcome_column: 'zscore'
+  sequence_id_column: 'person_id'
+  timestamp_column: 'days_on_TPN'
+  
+  # Scaling configuration - ensure all columns are standard scaled
+  scaling: 'standard'  # Use standard scaling for all columns
+  
+  # For continuous outcomes and treatments
+  outcome_type: 'continuous'
+  treatment_type: 'continuous'
+
+model:
+  dim_treatments: 16  # Number of treatment columns (removed Selenium)
+  dim_vitals: 27      # Number of vital columns
+  dim_static_features: 9  # Number of static columns
+  dim_outcomes: 1
+
+exp:
+  unscale_rmse: True
+  percentage_rmse: False  # For continuous outcomes, percentage might not make sense

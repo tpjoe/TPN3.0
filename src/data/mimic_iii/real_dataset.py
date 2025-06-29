@@ -48,7 +48,7 @@ class MIMIC3RealDataset(Dataset):
         outcomes = outcomes.unstack(fill_value=np.nan, level=0).stack(dropna=False).swaplevel(0, 1).sort_index()
         vitals = vitals.unstack(fill_value=np.nan, level=0).stack(dropna=False).swaplevel(0, 1).sort_index()
         outcomes_unscaled = outcomes_unscaled.unstack(fill_value=np.nan, level=0).stack(dropna=False).swaplevel(0, 1).sort_index()
-        active_entries = (~treatments.isna().any(1)).astype(float)
+        active_entries = (~treatments.isna().any(axis=1)).astype(float)
         static_features = static_features.sort_index()
         user_sizes = user_sizes.sort_index()
 

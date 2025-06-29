@@ -100,18 +100,26 @@ def main(args: DictConfig):
     results.update(encoder_results)
 
     test_rmses = {}
+    test_pearson_rs = {}
     if hasattr(dataset_collection, 'test_cf_treatment_seq'):  # Test n_step_counterfactual rmse
-        test_rmses = multimodel.get_normalised_n_step_rmses(dataset_collection.test_cf_treatment_seq)
+        rmses, pearson_rs = multimodel.get_normalised_n_step_rmses(dataset_collection.test_cf_treatment_seq)
+        test_rmses = rmses
+        test_pearson_rs = pearson_rs
     elif hasattr(dataset_collection, 'test_f_multi'):  # Test n_step_factual rmse
-        test_rmses = multimodel.get_normalised_n_step_rmses(dataset_collection.test_f_multi)
+        rmses, pearson_rs = multimodel.get_normalised_n_step_rmses(dataset_collection.test_f_multi)
+        test_rmses = rmses
+        test_pearson_rs = pearson_rs
     test_rmses = {f'{k+2}-step': v for (k, v) in enumerate(test_rmses)}
+    test_pearson_rs = {f'{k+2}-step': v for (k, v) in enumerate(test_pearson_rs)}
 
     logger.info(f'Test normalised RMSE (n-step prediction): {test_rmses}')
+    logger.info(f'Test Pearson correlation (n-step prediction): {test_pearson_rs}')
     decoder_results = {
         'decoder_val_rmse_all': val_rmse_all,
         'decoder_val_rmse_orig': val_rmse_orig
     }
     decoder_results.update({('decoder_test_rmse_' + k): v for (k, v) in test_rmses.items()})
+    decoder_results.update({('decoder_test_pearson_r_' + k): v for (k, v) in test_pearson_rs.items()})
 
     mlf_logger.log_metrics(decoder_results) if args.exp.logging else None
     results.update(decoder_results)

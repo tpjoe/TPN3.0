@@ -15,6 +15,7 @@ from pytorch_lightning import Trainer
 from torch_ema import ExponentialMovingAverage
 from typing import List
 from tqdm import tqdm
+from scipy.stats import pearsonr
 
 from src.data import RealDatasetCollection, SyntheticDatasetCollection
 from src.models.utils import grad_reverse, BRTreatmentOutcomeHead, AlphaRise, bce
@@ -283,7 +284,25 @@ class TimeVaryingCausalModel(LightningModule):
         if percentage:
             rmses_normalised_orig *= 100.0
 
-        return rmses_normalised_orig
+        # Calculate Pearson correlations for each timestep
+        mask = dataset.data_processed_seq['active_entries'][not_nan].astype(bool)
+        pearson_rs = []
+        for t in range(outputs_scaled.shape[1]):
+            mask_t = mask[:, t, :].flatten()
+            if unscale:
+                y_true = dataset.data_processed_seq['unscaled_outputs'][not_nan, t, :].flatten()[mask_t]
+                y_pred = outputs_unscaled[not_nan, t, :].flatten()[mask_t]
+            else:
+                y_true = dataset.data_processed_seq['outputs'][not_nan, t, :].flatten()[mask_t]
+                y_pred = outputs_scaled[not_nan, t, :].flatten()[mask_t]
+            
+            if len(y_true) > 1:  # Need at least 2 points for correlation
+                r, _ = pearsonr(y_true, y_pred)
+                pearson_rs.append(r)
+            else:
+                pearson_rs.append(np.nan)
+        
+        return rmses_normalised_orig, np.array(pearson_rs)
 
     @staticmethod
     def set_hparams(model_args: DictConfig, new_args: dict, input_size: int, model_type: str):
@@ -342,12 +361,17 @@ class TimeVaryingCausalModel(LightningModule):
         if kind == 'predict':
             bce_loss = bce(treatment_pred, current_treatments, mode, bce_weights)
         elif kind == 'confuse':
-            uniform_treatments = torch.ones_like(current_treatments)
-            if mode == 'multiclass':
-                uniform_treatments *= 1 / current_treatments.shape[-1]
-            elif mode == 'multilabel':
-                uniform_treatments *= 0.5
-            bce_loss = bce(treatment_pred, uniform_treatments, mode)
+            if mode == 'continuous':
+                # For continuous treatments, confuse means predict zero (no treatment)
+                zero_treatments = torch.zeros_like(current_treatments)
+                bce_loss = bce(treatment_pred, zero_treatments, mode)
+            else:
+                uniform_treatments = torch.ones_like(current_treatments)
+                if mode == 'multiclass':
+                    uniform_treatments *= 1 / current_treatments.shape[-1]
+                elif mode == 'multilabel':
+                    uniform_treatments *= 0.5
+                bce_loss = bce(treatment_pred, uniform_treatments, mode)
         else:
             raise NotImplementedError()
         return bce_loss
@@ -529,10 +553,33 @@ class BRCausalModel(TimeVaryingCausalModel):
         mse_loss = (batch['active_entries'] * mse_loss).sum() / batch['active_entries'].sum()
         loss = bce_loss + mse_loss
 
+        # Calculate Pearson correlation coefficient for outcomes
+        mask = batch['active_entries'].cpu().numpy().astype(bool)
+        y_true = batch['outputs'].cpu().numpy()[mask].flatten()
+        y_pred = outcome_pred.cpu().numpy()[mask].flatten()
+        pearson_r, _ = pearsonr(y_true, y_pred)
+
+        # Calculate Pearson correlation coefficient for treatments (average across dimensions)
+        mask_treatments = batch['active_entries'].squeeze(-1).cpu().numpy().astype(bool)
+        treatment_true = batch['current_treatments'].double().cpu().numpy()
+        treatment_pred_np = treatment_pred.cpu().numpy()
+        
+        treatment_correlations = []
+        for dim in range(treatment_true.shape[-1]):
+            t_true = treatment_true[:, :, dim][mask_treatments].flatten()
+            t_pred = treatment_pred_np[:, :, dim][mask_treatments].flatten()
+            if len(t_true) > 1:
+                r, _ = pearsonr(t_true, t_pred)
+                treatment_correlations.append(r)
+        
+        avg_treatment_pearson_r = np.mean(treatment_correlations) if treatment_correlations else np.nan
+
         subset_name = self.test_dataloader().dataset.subset_name
         self.log(f'{self.model_type}_{subset_name}_loss', loss, on_epoch=True, on_step=False, sync_dist=True)
         self.log(f'{self.model_type}_{subset_name}_bce_loss', bce_loss, on_epoch=True, on_step=False, sync_dist=True)
         self.log(f'{self.model_type}_{subset_name}_mse_loss', mse_loss, on_epoch=True, on_step=False, sync_dist=True)
+        self.log(f'{self.model_type}_{subset_name}_pearson_r', pearson_r, on_epoch=True, on_step=False, sync_dist=True)
+        self.log(f'{self.model_type}_{subset_name}_treatment_pearson_r', avg_treatment_pearson_r, on_epoch=True, on_step=False, sync_dist=True)
 
     def predict_step(self, batch, batch_idx, dataset_idx=None):
         """
