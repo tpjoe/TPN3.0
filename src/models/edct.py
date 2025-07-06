@@ -1,5 +1,5 @@
 from pytorch_lightning import LightningModule
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 import torch
 from torch import nn
 from omegaconf.errors import MissingMandatoryValue
@@ -113,8 +113,14 @@ class EDCT(BRCausalModel):
             self.transformer_blocks = nn.ModuleList(self.transformer_blocks)
             self.output_dropout = nn.Dropout(self.dropout_rate)
 
+            # Use single head with combined dimensions for multitask
+            if isinstance(self.dim_outcome, (list, ListConfig)):
+                total_dim_outcome = sum(self.dim_outcome)
+            else:
+                total_dim_outcome = self.dim_outcome
+                
             self.br_treatment_outcome_head = BRTreatmentOutcomeHead(self.seq_hidden_units, self.br_size,
-                                                                    self.fc_hidden_units, self.dim_treatments, self.dim_outcome,
+                                                                    self.fc_hidden_units, self.dim_treatments, total_dim_outcome,
                                                                     self.alpha, self.update_alpha, self.balancing)
         except MissingMandatoryValue:
             logger.warning(f"{self.model_type} not fully initialised - some mandatory args are missing! "
@@ -278,8 +284,19 @@ class EDCTEncoder(EDCT):
         active_entries = batch['active_entries']
 
         br = self.build_br(prev_treatments, vitals_or_prev_outputs, static_features, active_entries)
+        
         treatment_pred = self.br_treatment_outcome_head.build_treatment(br, detach_treatment)
         outcome_pred = self.br_treatment_outcome_head.build_outcome(br, curr_treatments)
+        
+        # Split predictions if multiple outcomes
+        if hasattr(self, 'dim_outcome_list') and self.dim_outcome_list is not None:
+            outcome_pred_dict = {}
+            start_idx = 0
+            for outcome_name, dim in zip(self.dataset_collection.outcome_columns, self.dim_outcome_list):
+                end_idx = start_idx + dim
+                outcome_pred_dict[outcome_name] = outcome_pred[..., start_idx:end_idx]
+                start_idx = end_idx
+            outcome_pred = outcome_pred_dict
 
         return treatment_pred, outcome_pred, br
 
@@ -325,7 +342,18 @@ class EDCTDecoder(EDCT):
 
         br = self.build_br(prev_treatments, vitals_or_prev_outputs, static_features, active_entries, encoder_br,
                            active_encoder_br)
+        
         treatment_pred = self.br_treatment_outcome_head.build_treatment(br, detach_treatment)
         outcome_pred = self.br_treatment_outcome_head.build_outcome(br, curr_treatments)
+        
+        # Split predictions if multiple outcomes
+        if hasattr(self, 'dim_outcome_list') and self.dim_outcome_list is not None:
+            outcome_pred_dict = {}
+            start_idx = 0
+            for outcome_name, dim in zip(self.dataset_collection.outcome_columns, self.dim_outcome_list):
+                end_idx = start_idx + dim
+                outcome_pred_dict[outcome_name] = outcome_pred[..., start_idx:end_idx]
+                start_idx = end_idx
+            outcome_pred = outcome_pred_dict
 
         return treatment_pred, outcome_pred, br

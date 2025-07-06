@@ -14,7 +14,7 @@ def main():
         "exp.gpus=null",  # Use CPU
         "exp.logging=False",  # Disable MLflow logging
         "exp.seed=42",
-        "exp.max_epochs=40"
+        "exp.max_epochs=70"
     ]
     
     print("Running command:", " ".join(cmd))

@@ -1,5 +1,5 @@
 from pytorch_lightning import LightningModule
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 import torch
 from torch import nn
 from omegaconf.errors import MissingMandatoryValue
@@ -55,7 +55,9 @@ class CT(EDCT):
             self.projection_horizon = projection_horizon
 
         # Used in hparam tuning
-        self.input_size = max(self.dim_treatments, self.dim_static_features, self.dim_vitals, self.dim_outcome)
+        # Handle list dim_outcome
+        dim_outcome_max = sum(self.dim_outcome) if isinstance(self.dim_outcome, (list, ListConfig)) else self.dim_outcome
+        self.input_size = max(self.dim_treatments, self.dim_static_features, self.dim_vitals, dim_outcome_max)
         logger.info(f'Max input size of {self.model_type}: {self.input_size}')
         assert self.autoregressive  # prev_outcomes are obligatory
 
@@ -79,8 +81,10 @@ class CT(EDCT):
             self.treatments_input_transformation = nn.Linear(self.dim_treatments, self.seq_hidden_units)
             self.vitals_input_transformation = \
                 nn.Linear(self.dim_vitals, self.seq_hidden_units) if self.has_vitals else None
-            self.vitals_input_transformation = nn.Linear(self.dim_vitals, self.seq_hidden_units) if self.has_vitals else None
-            self.outputs_input_transformation = nn.Linear(self.dim_outcome, self.seq_hidden_units)
+            
+            # Handle multiple outcomes properly
+            total_dim_outcome = sum(self.dim_outcome) if isinstance(self.dim_outcome, (list, ListConfig)) else self.dim_outcome
+            self.outputs_input_transformation = nn.Linear(total_dim_outcome, self.seq_hidden_units)
             self.static_input_transformation = nn.Linear(self.dim_static_features, self.seq_hidden_units)
 
             self.n_inputs = 3 if self.has_vitals else 2  # prev_outcomes and prev_treatments
@@ -95,9 +99,7 @@ class CT(EDCT):
                                       disable_cross_attention=sub_args.disable_cross_attention,
                                       isolate_subnetwork=sub_args.isolate_subnetwork) for _ in range(self.num_layer)])
 
-            self.br_treatment_outcome_head = BRTreatmentOutcomeHead(self.seq_hidden_units, self.br_size,
-                                                                    self.fc_hidden_units, self.dim_treatments, self.dim_outcome,
-                                                                    self.alpha, self.update_alpha, self.balancing)
+            # Don't create single head here - let EDCT parent class handle multiple heads
 
             # self.last_layer_norm = LayerNorm(self.seq_hidden_units)
         except MissingMandatoryValue:
@@ -132,8 +134,19 @@ class CT(EDCT):
         active_entries = batch['active_entries']
 
         br = self.build_br(prev_treatments, vitals, prev_outputs, static_features, active_entries, fixed_split)
+        
         treatment_pred = self.br_treatment_outcome_head.build_treatment(br, detach_treatment)
         outcome_pred = self.br_treatment_outcome_head.build_outcome(br, curr_treatments)
+        
+        # Split predictions if multiple outcomes
+        if hasattr(self, 'dim_outcome_list') and self.dim_outcome_list is not None:
+            outcome_pred_dict = {}
+            start_idx = 0
+            for outcome_name, dim in zip(self.dataset_collection.outcome_columns, self.dim_outcome_list):
+                end_idx = start_idx + dim
+                outcome_pred_dict[outcome_name] = outcome_pred[..., start_idx:end_idx]
+                start_idx = end_idx
+            outcome_pred = outcome_pred_dict
 
         return treatment_pred, outcome_pred, br
 
@@ -196,7 +209,29 @@ class CT(EDCT):
             for i in range(len(dataset)):
                 split = int(dataset.data['future_past_split'][i])
                 if t < self.hparams.dataset.projection_horizon:
-                    dataset.data['prev_outputs'][i, split + t, :] = outputs_scaled[i, split - 1 + t, :]
+                    # Handle multiple outcomes with different types
+                    if hasattr(self.dataset_collection, 'outcome_types'):
+                        # Multiple outcomes case
+                        prev_output_values = []
+                        start_idx = 0
+                        for j, (otype, dim) in enumerate(zip(self.dataset_collection.outcome_types, self.hparams.model.dim_outcomes)):
+                            end_idx = start_idx + dim
+                            if otype == 'binary':
+                                # Apply sigmoid to get probabilities for binary outcomes
+                                probs = 1 / (1 + np.exp(-outputs_scaled[i, split - 1 + t, start_idx:end_idx]))
+                                prev_output_values.append(probs)
+                            else:
+                                # Keep continuous values as is
+                                prev_output_values.append(outputs_scaled[i, split - 1 + t, start_idx:end_idx])
+                            start_idx = end_idx
+                        dataset.data['prev_outputs'][i, split + t, :] = np.concatenate(prev_output_values)
+                    elif hasattr(self.dataset_collection, 'outcome_type') and self.dataset_collection.outcome_type == 'binary':
+                        # Single binary outcome - original code
+                        probs = 1 / (1 + np.exp(-outputs_scaled[i, split - 1 + t, :]))
+                        dataset.data['prev_outputs'][i, split + t, :] = probs
+                    else:
+                        # Single continuous outcome - original code
+                        dataset.data['prev_outputs'][i, split + t, :] = outputs_scaled[i, split - 1 + t, :]
                 if t > 0:
                     predicted_outputs[i, t - 1, :] = outputs_scaled[i, split - 1 + t, :]
 

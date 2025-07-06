@@ -7,6 +7,7 @@ import logging
 
 from torch.utils.data import Dataset
 from sklearn.model_selection import train_test_split
+from copy import deepcopy
 
 from src import ROOT_PATH
 from src.data.dataset_collection import RealDatasetCollection
@@ -44,10 +45,11 @@ class MIMIC3RealDataset(Dataset):
         user_sizes = vitals.groupby('subject_id').size()
 
         # Padding with nans
-        treatments = treatments.unstack(fill_value=np.nan, level=0).stack(dropna=False).swaplevel(0, 1).sort_index()
-        outcomes = outcomes.unstack(fill_value=np.nan, level=0).stack(dropna=False).swaplevel(0, 1).sort_index()
-        vitals = vitals.unstack(fill_value=np.nan, level=0).stack(dropna=False).swaplevel(0, 1).sort_index()
-        outcomes_unscaled = outcomes_unscaled.unstack(fill_value=np.nan, level=0).stack(dropna=False).swaplevel(0, 1).sort_index()
+        # Use future_stack=True to avoid FutureWarning about deprecated stack behavior
+        treatments = treatments.unstack(fill_value=np.nan, level=0).stack(future_stack=True).swaplevel(0, 1).sort_index()
+        outcomes = outcomes.unstack(fill_value=np.nan, level=0).stack(future_stack=True).swaplevel(0, 1).sort_index()
+        vitals = vitals.unstack(fill_value=np.nan, level=0).stack(future_stack=True).swaplevel(0, 1).sort_index()
+        outcomes_unscaled = outcomes_unscaled.unstack(fill_value=np.nan, level=0).stack(future_stack=True).swaplevel(0, 1).sort_index()
         active_entries = (~treatments.isna().any(axis=1)).astype(float)
         static_features = static_features.sort_index()
         user_sizes = user_sizes.sort_index()
@@ -96,14 +98,138 @@ class MIMIC3RealDataset(Dataset):
 
     def __len__(self):
         return len(self.data['active_entries'])
+    
+    def _unscale_outputs(self, scaled_outputs):
+        """Helper method to unscale outputs, handling both dict and array scaling params"""
+        output_means = self.scaling_params['output_means']
+        output_stds = self.scaling_params['output_stds']
+        
+        if isinstance(output_means, dict):
+            # Multiple outcomes - unscale each separately
+            unscaled = np.zeros_like(scaled_outputs)
+            start_idx = 0
+            for outcome_name, (mean, std) in zip(output_means.keys(), zip(output_means.values(), output_stds.values())):
+                # Assume single dimension per outcome for now
+                unscaled[..., start_idx] = scaled_outputs[..., start_idx] * std + mean
+                start_idx += 1
+            return unscaled
+        else:
+            # Single outcome - original behavior
+            return scaled_outputs * output_stds + output_means
 
-    def explode_trajectories(self, projection_horizon):
+    def create_one_seq_per_patient_for_n_step(self, projection_horizon):
+        """
+        Create dataset where each patient contributes exactly ONE sequence per n-step prediction.
+        For n-step prediction: use first (seq_len - n) timesteps to predict last n timesteps.
+        
+        Args:
+            projection_horizon: Maximum number of steps to predict (will create 1 through projection_horizon+1 step predictions)
+        """
+        logger.info(f'Creating one sequence per patient for n-step predictions on {self.subset_name}')
+        
+        # Get original data
+        outputs = self.data['outputs']
+        prev_outputs = self.data['prev_outputs']
+        sequence_lengths = self.data['sequence_lengths']
+        vitals = self.data['vitals']
+        next_vitals = self.data['next_vitals']
+        active_entries = self.data['active_entries']
+        current_treatments = self.data['current_treatments']
+        previous_treatments = self.data['prev_treatments']
+        static_features = self.data['static_features']
+        
+        # Filter to only include patients with enough timesteps for all predictions
+        min_required_length = projection_horizon + 1 + 1  # Need at least 1 history timestep
+        valid_patients = sequence_lengths >= min_required_length
+        valid_indices = np.where(valid_patients)[0]
+        
+        logger.info(f'Using {len(valid_indices)} patients with at least {min_required_length} timesteps')
+        
+        # Create a dict to store data for each n-step
+        n_step_datasets = {}
+        
+        # For each n-step prediction (0-step through projection_horizon+1-step)
+        # 0-step means use full sequence (no truncation)
+        for n_step in range(0, projection_horizon + 2):
+            # Arrays for this n-step
+            n_patients = len(valid_indices)
+            max_seq_length = outputs.shape[1]
+            
+            seq_outputs = np.zeros((n_patients, max_seq_length, outputs.shape[-1]))
+            seq_prev_outputs = np.zeros((n_patients, max_seq_length, prev_outputs.shape[-1]))
+            seq_vitals = np.zeros((n_patients, max_seq_length, vitals.shape[-1]))
+            seq_next_vitals = np.zeros((n_patients, max_seq_length - 1, next_vitals.shape[-1]))
+            seq_active_entries = np.zeros((n_patients, max_seq_length, active_entries.shape[-1]))
+            seq_current_treatments = np.zeros((n_patients, max_seq_length, current_treatments.shape[-1]))
+            seq_previous_treatments = np.zeros((n_patients, max_seq_length, previous_treatments.shape[-1]))
+            seq_static_features = np.zeros((n_patients, static_features.shape[-1]))
+            seq_sequence_lengths = np.zeros(n_patients)
+            
+            # For each valid patient
+            for idx, patient_idx in enumerate(valid_indices):
+                seq_len = int(sequence_lengths[patient_idx])
+                
+                if n_step == 0:
+                    # Special case: 0-step means use the full sequence (no truncation)
+                    history_length = seq_len
+                else:
+                    history_length = seq_len - n_step
+                
+                if history_length >= 1:  # Need at least 1 timestep of history
+                    # Copy the history portion (for 0-step, this is the full sequence)
+                    seq_outputs[idx, :history_length, :] = outputs[patient_idx, :history_length, :]
+                    seq_prev_outputs[idx, :history_length, :] = prev_outputs[patient_idx, :history_length, :]
+                    seq_vitals[idx, :history_length, :] = vitals[patient_idx, :history_length, :]
+                    seq_next_vitals[idx, :min(history_length, seq_len-1), :] = next_vitals[patient_idx, :min(history_length, seq_len-1), :]
+                    seq_active_entries[idx, :history_length, :] = active_entries[patient_idx, :history_length, :]
+                    seq_current_treatments[idx, :history_length, :] = current_treatments[patient_idx, :history_length, :]
+                    seq_previous_treatments[idx, :history_length, :] = previous_treatments[patient_idx, :history_length, :]
+                    seq_static_features[idx] = static_features[patient_idx]
+                    seq_sequence_lengths[idx] = history_length
+                    
+            # Store this n-step dataset with additional metadata
+            n_step_data = {
+                'outputs': seq_outputs,
+                'prev_outputs': seq_prev_outputs,
+                'vitals': seq_vitals,
+                'next_vitals': seq_next_vitals,
+                'active_entries': seq_active_entries,
+                'current_treatments': seq_current_treatments,
+                'prev_treatments': seq_previous_treatments,
+                'static_features': seq_static_features,
+                'sequence_lengths': seq_sequence_lengths,
+                'unscaled_outputs': seq_outputs * self.scaling_params['output_stds'] + self.scaling_params['output_means'],
+                'n_step': n_step,  # Track which n-step this is for
+                'true_future_outputs': outputs[valid_indices],  # Keep full sequences for evaluation
+                'original_patient_idx': valid_indices,  # Track original patient indices
+                'history_lengths': seq_sequence_lengths  # Store history lengths for verification
+            }
+            
+            n_step_datasets[n_step] = n_step_data
+            if seq_sequence_lengths[seq_sequence_lengths > 0].size > 0:
+                if n_step == 0:
+                    logger.info(f'{n_step}-step (full sequence): {n_patients} patients, sequence lengths: {seq_sequence_lengths[seq_sequence_lengths > 0].min():.0f}-{seq_sequence_lengths.max():.0f}')
+                else:
+                    logger.info(f'{n_step}-step: {n_patients} patients, history lengths: {seq_sequence_lengths[seq_sequence_lengths > 0].min():.0f}-{seq_sequence_lengths.max():.0f}')
+        
+        # Store all n-step datasets
+        self.n_step_datasets = n_step_datasets
+        self.valid_patient_indices = valid_indices
+        
+        return n_step_datasets
+    
+    def explode_trajectories(self, projection_horizon, min_length_filter=False):
         """
         Convert test dataset to a dataset with rolling origin
         Args:
             projection_horizon: projection horizon
+            min_length_filter: If True, only include patients with enough timesteps for all multi-step predictions
         """
         assert self.processed
+        
+        # Save the truly original data before explosion
+        if not hasattr(self, 'data_before_explosion'):
+            self.data_before_explosion = deepcopy(self.data)
 
         logger.info(f'Exploding {self.subset_name} dataset before testing (multiple sequences)')
 
@@ -120,6 +246,28 @@ class MIMIC3RealDataset(Dataset):
             stabilized_weights = self.data['stabilized_weights']
 
         num_patients, max_seq_length, num_features = outputs.shape
+        
+        # Filter patients if requested
+        if min_length_filter:
+            min_required_length = projection_horizon + 1 + 1  # e.g., for projection_horizon=5, need at least 7 timesteps
+            valid_patients = sequence_lengths >= min_required_length
+            logger.info(f'Filtering to patients with at least {min_required_length} timesteps: {np.sum(valid_patients)} out of {num_patients} patients')
+            
+            # Apply filter
+            outputs = outputs[valid_patients]
+            prev_outputs = prev_outputs[valid_patients]
+            sequence_lengths = sequence_lengths[valid_patients]
+            vitals = vitals[valid_patients] if vitals.shape[0] > 0 else vitals
+            next_vitals = next_vitals[valid_patients] if next_vitals.shape[0] > 0 else next_vitals
+            active_entries = active_entries[valid_patients]
+            current_treatments = current_treatments[valid_patients]
+            previous_treatments = previous_treatments[valid_patients]
+            static_features = static_features[valid_patients]
+            if 'stabilized_weights' in self.data:
+                stabilized_weights = stabilized_weights[valid_patients]
+            
+            num_patients = outputs.shape[0]
+            
         num_seq2seq_rows = num_patients * max_seq_length
 
         seq2seq_previous_treatments = np.zeros((num_seq2seq_rows, max_seq_length, previous_treatments.shape[-1]))
@@ -177,7 +325,7 @@ class MIMIC3RealDataset(Dataset):
             'outputs': seq2seq_outputs,
             'vitals': seq2seq_vitals,
             'next_vitals': seq2seq_next_vitals,
-            'unscaled_outputs': seq2seq_outputs * self.scaling_params['output_stds'] + self.scaling_params['output_means'],
+            'unscaled_outputs': self._unscale_outputs(seq2seq_outputs),
             'sequence_lengths': seq2seq_sequence_lengths,
             'active_entries': seq2seq_active_entries,
         }
@@ -287,7 +435,7 @@ class MIMIC3RealDataset(Dataset):
                 'static_features': seq2seq_static_features,
                 'prev_outputs': seq2seq_prev_outputs,
                 'outputs': seq2seq_outputs,
-                'unscaled_outputs': seq2seq_outputs * self.scaling_params['output_stds'] + self.scaling_params['output_means'],
+                'unscaled_outputs': self._unscale_outputs(seq2seq_outputs),
                 'sequence_lengths': seq2seq_sequence_lengths,
                 'active_entries': seq2seq_active_entries,
             }
@@ -370,7 +518,7 @@ class MIMIC3RealDataset(Dataset):
                 'static_features': self.data['static_features'],
                 'prev_outputs': seq2seq_prev_outputs,
                 'outputs': seq2seq_outputs,
-                'unscaled_outputs': seq2seq_outputs * self.scaling_params['output_stds'] + self.scaling_params['output_means'],
+                'unscaled_outputs': self._unscale_outputs(seq2seq_outputs),
                 'sequence_lengths': seq2seq_sequence_lengths,
                 'active_entries': seq2seq_active_entries,
             }

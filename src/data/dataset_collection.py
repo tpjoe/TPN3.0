@@ -150,7 +150,8 @@ class RealDatasetCollection:
         Used by CRN, RMSN, EDCT
         """
         # Multiplying test trajectories
-        self.test_f.explode_trajectories(self.projection_horizon)
+        min_length_filter = getattr(self, 'min_length_filter', False)
+        self.test_f.explode_trajectories(self.projection_horizon, min_length_filter=min_length_filter)
 
         # Representation generation / One-step ahead prediction with encoder
         r_train_f = encoder.get_representations(self.train_f)
@@ -174,7 +175,8 @@ class RealDatasetCollection:
         self.test_f_multi = deepcopy(self.test_f)
 
         # Multiplying test trajectories
-        self.test_f_multi.explode_trajectories(self.projection_horizon)
+        min_length_filter = getattr(self, 'min_length_filter', False)
+        self.test_f_multi.explode_trajectories(self.projection_horizon, min_length_filter=min_length_filter)
 
         self.test_f_multi.process_sequential_test(self.projection_horizon)
         self.test_f_multi.process_sequential_multi(self.projection_horizon)

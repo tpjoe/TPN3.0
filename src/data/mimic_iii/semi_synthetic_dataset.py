@@ -558,8 +558,12 @@ class MIMIC3SyntheticDataset(MIMIC3RealDataset):
 
             self.data['outputs'] = (self.data['unscaled_outputs'] - scaling_params['output_means']) / \
                 scaling_params['output_stds']
+            # Handle NaN values from zero std
+            self.data['outputs'] = np.nan_to_num(self.data['outputs'], nan=0.0)
+            
             self.data['prev_outputs'] = (self.data['prev_unscaled_outputs'] - scaling_params['output_means']) / \
                 scaling_params['output_stds']
+            self.data['prev_outputs'] = np.nan_to_num(self.data['prev_outputs'], nan=0.0)
 
             # if self.autoregressive:
             #     self.data['vitals'] = np.concatenate([self.data['vitals'], self.data['prev_outputs']], axis=2)

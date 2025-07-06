@@ -24,7 +24,10 @@ def process_static_features(static_features: pd.DataFrame, drop_first=False) -> 
         if isinstance(static_features[feature].iloc[0], float):
             mean = np.mean(static_features[feature])
             std = np.std(static_features[feature])
-            processed_static_features.append((static_features[feature] - mean) / std)
+            scaled_feature = (static_features[feature] - mean) / std
+            # Handle NaN values from zero std
+            scaled_feature = scaled_feature.fillna(0.0)
+            processed_static_features.append(scaled_feature)
         else:
             one_hot = pd.get_dummies(static_features[feature], drop_first=drop_first)
             processed_static_features.append(one_hot.astype(float))
@@ -145,6 +148,8 @@ def load_mimic3_data_processed(data_path: str,
     mean = np.mean(all_vitals, axis=0)
     std = np.std(all_vitals, axis=0)
     all_vitals = (all_vitals - mean) / std
+    # Handle NaN values from zero std
+    all_vitals = all_vitals.fillna(0.0)
 
     # Splitting outcomes and vitals
     outcomes = all_vitals[outcome_list].copy()
@@ -251,6 +256,8 @@ def load_mimic3_data_raw(data_path: str,
     mean = np.mean(all_vitals, axis=0)
     std = np.std(all_vitals, axis=0)
     all_vitals = (all_vitals - mean) / std
+    # Handle NaN values from zero std
+    all_vitals = all_vitals.fillna(0.0)
 
     static_features = process_static_features(static_features, drop_first=drop_first)
 
