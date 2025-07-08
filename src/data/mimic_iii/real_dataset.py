@@ -73,7 +73,7 @@ class MIMIC3RealDataset(Dataset):
             'active_entries': active_entries[:, 1:, :],
             'outputs': outcomes[:, 1:, :],
             'unscaled_outputs': outcomes_unscaled[:, 1:, :],
-            'prev_outputs': outcomes[:, :-1, :],
+            'prev_outputs': outcomes[:, :-1, :].copy(),  # Make a copy to avoid aliasing issues
         }
 
         self.scaling_params = scaling_params

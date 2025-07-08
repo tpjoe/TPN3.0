@@ -1,130 +1,102 @@
 # @package _global_
 dataset:
-  _target_: src.data.synthetic_neonatal.SyntheticNeonatalDatasetCollection   # Will be dynamically instantiated
+  # Central disease configuration - change this to switch diseases
+  # Options: bpd, nec, rop, death, max_chole_TPNEHR (or their dated_ versions)
+  target_disease: rop
+  _target_: src.data.synthetic_neonatal.SyntheticNeonatalDatasetCollection
   name: synthetic_neonatal
-  path: data/processed/autoregressive.csv
-  seed: ${exp.seed}
-  min_seq_length: 0   # Lower than 15 to include all sequences
-  max_seq_length: 30
-  projection_horizon: 0
-  cf_seq_mode: sliding_treatment
-  val_batch_size: 512
-  treatment_mode: continuous   # Changed from multiclass to continuous
-  
-  # Column specifications
+  path: data/processed/autoregressive.csv  # Path to the CSV data file
+  seed: ${exp.seed}  # Random seed for data splitting
+  min_seq_length: 2  # Minimum sequence length to include in dataset
+  max_seq_length: 30  # Maximum sequence length (truncates longer sequences)
+  projection_horizon: 0  # Number of future steps to predict (0 = next timestep only)
+  cf_seq_mode: sliding_treatment  # Counterfactual sequence generation mode
+  val_batch_size: 512  # Batch size for validation/test sets
+  treatment_mode: continuous  # Treatment type: continuous or binary
   vital_columns:
-    - 'Alb_lab_value'
-    - 'Ca_lab_value'
-    - 'Cl_lab_value'
-    - 'CO2_lab_value'
-    - 'Glu_lab_value'
-    - 'K_lab_value'
-    - 'Mg_lab_value'
-    - 'Na_lab_value'
-    - 'PO4_lab_value'
-    - 'BUN_lab_value'
-    - 'Cr_lab_value'
-    - 'Tri_lab_value'
-    - 'ALKP_lab_value'
-    - 'ALT_lab_value'
-    - 'AST_lab_value'
-    - 'CaI_lab_value'
-    - 'day_since_birth'
-    - 'FluidDose'
-    - 'EnteralDose'
-    - 'days_on_TPN'
-    - 'TPNDose'
-    - 'TPNHours'
-    - 'ProtocolName_NEONATAL'
-    - 'LineID_2'
-    - 'FatProduct_SMOFlipid 20%'
-    - 'FatProduct_Intralipid 20%'
-    - 'FatProduct_Omegaven 10%'
-    - 'TodaysWeight'
-  
+  - Alb_lab_value
+  - Ca_lab_value
+  - Cl_lab_value
+  - CO2_lab_value
+  - Glu_lab_value
+  - K_lab_value
+  - Mg_lab_value
+  - Na_lab_value
+  - PO4_lab_value
+  - BUN_lab_value
+  - Cr_lab_value
+  - Tri_lab_value
+  - ALKP_lab_value
+  - ALT_lab_value
+  - AST_lab_value
+  - CaI_lab_value
+  - day_since_birth
+  - FluidDose
+  - EnteralDose
+  - days_on_TPN
+  - TPNDose
+  - TPNHours
+  - ProtocolName_NEONATAL
+  - LineID_2
+  - FatProduct_SMOFlipid 20%
+  - FatProduct_Intralipid 20%
+  - FatProduct_Omegaven 10%
+  - TodaysWeight
   static_columns:
-    - 'gest_age'
-    - 'bw'
-    - 'gender_concept_id_8507'
-    - 'gender_concept_id_8532'
-    - 'race_concept_id_8515'
-    - 'race_concept_id_8516'
-    - 'race_concept_id_8527'
-    - 'race_concept_id_8557'
-    - 'race_concept_id_8657'
-  
-  # Multiple treatment columns for continuous treatments
+  - gest_age
+  - bw
+  - gender_concept_id_8507
+  - gender_concept_id_8532
+  - race_concept_id_8515
+  - race_concept_id_8516
+  - race_concept_id_8527
+  - race_concept_id_8557
+  - race_concept_id_8657
   treatment_columns:
-    - 'FatDose'
-    - 'AADose'
-    - 'DexDose'
-    - 'Acetate'
-    - 'Calcium'
-    - 'Copper'
-    - 'Famotidine'
-    - 'Levocar'
-    - 'Magnesium'
-    - 'MVITotal'
-    - 'Phosphate'
-    - 'Potassium'
-    # - 'Selenium'  # Removed: has zero variance (constant value)
-    - 'Sodium'
-    - 'Zinc'
-    - 'Chloride'
-    - 'GIR'
-  
-  # Multiple outcome columns for multitask learning
+  - FatDose
+  - AADose
+  - DexDose
+  - Acetate
+  - Calcium
+  - Copper
+  - Famotidine
+  - Levocar
+  - Magnesium
+  - MVITotal
+  - Phosphate
+  - Potassium
+  - Sodium
+  - Zinc
+  - Chloride
+  - GIR
   outcome_columns:
-    # - 'zscore'
-    - 'dated_max_chole_TPNEHR'
-  
-  # Outcome types corresponding to outcome_columns
+  - ${dataset.target_disease}  # Disease outcome to predict
   outcome_types:
-    # - 'continuous'
-    - 'binary'
-  
-  sequence_id_column: 'person_id'
-  timestamp_column: 'days_on_TPN'
-  
-  # Scaling configuration - ensure all columns are standard scaled
-  scaling: 'standard'  # Use standard scaling for all columns
-  
-  # For continuous treatments
-  treatment_type: 'continuous'
-  
-  # Right censoring for survival analysis
-  right_censor: True  # If True, censor data after first positive outcome
-  
-  # Outcome shifting for n-day-ahead prediction
-  outcome_shift: 0  # Number of days to shift outcomes earlier (0 = predict same day, 1 = predict 1 day ahead)
-  
-  # Multi-step evaluation filtering
-  min_length_filter: True  # If True, only include patients with enough timesteps for all multi-step predictions
-  one_seq_per_patient_eval: True  # If True, use only one sequence per patient per n-step evaluation
-  
-  # Train/validation/test split
+  - binary  # Type of outcome: binary or continuous
+  sequence_id_column: person_id  # Column identifying unique patients
+  timestamp_column: days_on_TPN  # Column containing time information
+  scaling: standard  # Feature scaling method: standard or minmax
+  treatment_type: continuous  # Type of treatment features
+  right_censor: true  # Apply right censoring based on disease date
+  outcome_shift: 0  # Shift outcomes by n timesteps (for next-step prediction)
+  last_timepoint_only: true  # Only use last timestep for loss (seq2one vs seq2seq)
+  min_length_filter: true  # Filter out sequences shorter than min_seq_length
+  one_seq_per_patient_eval: true  # Use one sequence per patient for evaluation
   split:
-    val: 0.2   # 20% for validation (from remaining after test split)
-    test: 0.2  # 20% for test
-  
-  # Task weights for multitask learning (used when use_gradnorm=False)
+    val: 0.2
+    test: 0.2
   task_weights:
-    # zscore: 1.0
-    dated_max_chole_TPNEHR: 1.0
-  
-  # Use GradNorm for automatic task weight balancing
-  use_gradnorm: False
-  gradnorm_alpha: 1.5  # Asymmetry parameter (higher = more aggressive balancing)
-
+    ${dataset.target_disease}: 1.0  # Weight for this task in multi-task learning
+  use_gradnorm: false  # Enable GradNorm for automatic task weight balancing
+  gradnorm_alpha: 1.5  # Alpha parameter for GradNorm (controls convergence speed)
+  mute_decoder: true  # Zero out autoregressive inputs to prevent data leakage
 model:
-  dim_treatments: 16  # Number of treatment columns (removed Selenium)
-  dim_vitals: 27      # Number of vital columns
-  dim_static_features: 9  # Number of static columns
-  dim_outcomes: [1]  # Dimensions for each outcome: [zscore, disease]
-
+  dim_treatments: ???
+  dim_vitals: ???
+  dim_static_features: ???
+  dim_outcomes:
+  - 1
 exp:
-  # Task-specific RMSE unscaling
   unscale_rmse:
-    disease: False  # Don't unscale for binary outcome
-    # zscore: True  # Unscale for continuous outcome
-  percentage_rmse: False  # For binary outcomes, percentage doesn't make sense
+    disease: false
+  percentage_rmse: false

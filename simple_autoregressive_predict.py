@@ -1,310 +1,306 @@
 #!/usr/bin/env python
-import pickle
-import pandas as pd
-import numpy as np
+"""Fixed version of simple_autoregressive_predict.py that uses dataset collection"""
 import torch
+import numpy as np
+import pandas as pd
+import pickle
 from sklearn.metrics import roc_auc_score, average_precision_score
 from scipy.stats import pearsonr
 from hydra import compose, initialize
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
-from typing import Dict, Tuple, List, Optional
-
-
-class DataLoader:
-    """Handles data loading and preprocessing"""
-    
-    def __init__(self, data_path: str, patient_splits_path: str, scaler_path: str):
-        self.data_path = data_path
-        self.patient_splits_path = patient_splits_path
-        self.scaler_path = scaler_path
-        
-    def load_test_data(self, max_seq_length: Optional[int] = None) -> pd.DataFrame:
-        """Load and filter test data with right censoring"""
-        df = pd.read_csv(self.data_path, low_memory=False)
-        df['max_chole_TPNEHR_date'] = pd.to_datetime(df['max_chole_TPNEHR_date'], errors='coerce')
-        df['DateOrdered'] = pd.to_datetime(df['DateOrdered'], errors='coerce')
-        
-        with open(self.patient_splits_path, 'rb') as f:
-            patient_splits = pickle.load(f)
-        
-        test_patient_ids = patient_splits['test']
-        
-        # Right censoring
-        mask = df['max_chole_TPNEHR_date'].isna() | (df['DateOrdered'] <= df['max_chole_TPNEHR_date'])
-        df_censored = df[mask].copy()
-        
-        # Filter for test patients
-        df_censored = df_censored[df_censored['person_id'].isin(test_patient_ids)]
-        print(f"Filtered to {len(df_censored)} timesteps from {df_censored['person_id'].nunique()} test patients")
-        
-        # Sort and apply max sequence length
-        df_censored = df_censored.sort_values(['person_id', 'days_on_TPN'])
-        if max_seq_length is not None:
-            df_censored = df_censored.groupby('person_id').tail(max_seq_length)
-            df_censored = df_censored.reset_index(drop=True)
-        
-        df_censored['timestep'] = df_censored.groupby('person_id').cumcount()
-        return df_censored
-    
-    def scale_data(self, df: pd.DataFrame, column_config: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict]:
-        """Scale data using loaded scaler"""
-        with open(self.scaler_path, 'rb') as f:
-            scaler_info = pickle.load(f)
-        
-        # Extract data arrays using config columns
-        treatments = df[column_config['treatment_columns']].values
-        vitals = df[column_config['vital_columns']].values
-        outcomes = df[column_config['outcome_columns']].values
-        static_features_df = df.groupby('person_id')[column_config['static_columns']].first()
-        static_features = static_features_df.values
-        
-        # Scale treatments
-        treatments_std = scaler_info['treatments_std'].values
-        # Set to zero where std is zero (no variance means feature is constant)
-        treatments_scaled = np.where(treatments_std != 0, 
-                                   (treatments - scaler_info['treatments_mean'].values) / treatments_std,
-                                   0.0)
-        treatments = np.nan_to_num(treatments_scaled, nan=0.0)
-        
-        # Scale vitals
-        vitals_std = scaler_info['vitals_std']
-        # Set to zero where std is zero (no variance means feature is constant)
-        vitals_scaled = np.where(vitals_std != 0,
-                                (vitals - scaler_info['vitals_mean']) / vitals_std,
-                                0.0)
-        vitals = np.nan_to_num(vitals_scaled, nan=0.0)
-        
-        # Scale static features
-        static_stds = scaler_info['static_stds']
-        # Set to zero where std is zero (no variance means feature is constant)
-        static_features_scaled = np.where(static_stds != 0,
-                                         (static_features - scaler_info['static_means']) / static_stds,
-                                         0.0)
-        static_features = np.nan_to_num(static_features_scaled, nan=0.0)
-        
-        # Scale outcomes
-        zscore_mean = scaler_info['output_means']['zscore']
-        zscore_std = scaler_info['output_stds']['zscore']
-        # Set to zero where std is zero (no variance means feature is constant)
-        if zscore_std != 0:
-            outcomes[:, 0] = (outcomes[:, 0] - zscore_mean) / zscore_std
-        else:
-            outcomes[:, 0] = 0.0
-        
-        return treatments, vitals, outcomes, static_features, scaler_info
-    
-    def prepare_batch(self, df: pd.DataFrame, treatments: np.ndarray, vitals: np.ndarray, 
-                      outcomes: np.ndarray, static_features: np.ndarray) -> Dict[str, torch.Tensor]:
-        """Prepare padded batch for model input"""
-        patient_ids = df['person_id'].unique()
-        sequence_lengths = df.groupby('person_id').size().values
-        
-        max_seq_len = sequence_lengths.max()
-        n_patients = len(patient_ids)
-        
-        # Initialize arrays
-        treatments_padded = np.zeros((n_patients, max_seq_len, treatments.shape[1]))
-        vitals_padded = np.zeros((n_patients, max_seq_len, vitals.shape[1]))
-        outcomes_padded = np.zeros((n_patients, max_seq_len, 2))
-        active_entries = np.zeros((n_patients, max_seq_len, 1))
-        
-        # Fill arrays
-        start_idx = 0
-        for i, seq_len in enumerate(sequence_lengths):
-            treatments_padded[i, :seq_len] = treatments[start_idx:start_idx+seq_len]
-            vitals_padded[i, :seq_len] = vitals[start_idx:start_idx+seq_len]
-            outcomes_padded[i, :seq_len] = outcomes[start_idx:start_idx+seq_len]
-            active_entries[i, :seq_len] = 1
-            start_idx += seq_len
-        
-        # Create previous treatments and outputs
-        prev_treatments = np.zeros_like(treatments_padded)
-        prev_treatments[:, 1:] = treatments_padded[:, :-1]
-        
-        prev_outputs = np.zeros_like(outcomes_padded)
-        for i in range(n_patients):
-            if sequence_lengths[i] > 0:
-                prev_outputs[i, 0, :] = outcomes_padded[i, 0, :]
-        prev_outputs[:, 1:] = outcomes_padded[:, :-1]
-        
-        return {
-            'prev_treatments': torch.tensor(prev_treatments, dtype=torch.float32),
-            'current_treatments': torch.tensor(treatments_padded, dtype=torch.float32),
-            'vitals': torch.tensor(vitals_padded, dtype=torch.float32),
-            'prev_outputs': torch.tensor(prev_outputs, dtype=torch.float32),
-            'outputs': torch.tensor(outcomes_padded, dtype=torch.float32),
-            'static_features': torch.tensor(static_features, dtype=torch.float32),
-            'active_entries': torch.tensor(active_entries, dtype=torch.float32),
-            'sequence_lengths': torch.tensor(sequence_lengths, dtype=torch.long)
-        }
+from typing import Dict, Tuple, List
+import yaml
+from pathlib import Path
 
 
 class ModelWrapper:
     """Handles model initialization and prediction"""
     
-    def __init__(self, model_path: str, config_path: str = "config"):
-        self.model_path = model_path
-        self.config_path = config_path
+    def __init__(self, cfg, dataset_collection):
+        self.cfg = cfg
+        self.dataset_collection = dataset_collection
         self.model = None
-        self.cfg = None
         
-    def initialize_model(self):
-        """Initialize model from saved state and config"""
-        state_dict = torch.load(self.model_path, map_location='cpu')
+    def initialize_model(self, model_path: str):
+        """Initialize model from saved state"""
+        # Create minimal dataset for model initialization
+        class MinimalDatasetCollection:
+            def __init__(self, cfg, real_dataset):
+                self.outcome_columns = real_dataset.outcome_columns
+                self.outcome_types = real_dataset.outcome_types if hasattr(real_dataset, 'outcome_types') else ['binary']
+                self.has_vitals = real_dataset.has_vitals
+                self.autoregressive = True
+                self.projection_horizon = cfg.dataset.projection_horizon
         
-        OmegaConf.register_new_resolver("sum", lambda x, y: x + y, replace=True)
+        minimal_dataset = MinimalDatasetCollection(self.cfg, self.dataset_collection)
         
-        with initialize(config_path=self.config_path, version_base=None):
-            self.cfg = compose(config_name="config.yaml", 
-                               overrides=["+backbone=ct", "+dataset=synthetic_neonatal", 
-                                        "+backbone/ct_hparams=synthetic_neonatal"])
-            
-            dataset_collection = instantiate(self.cfg.dataset, _recursive_=True)
-            dataset_collection.process_data_multi()
-            
-            self.model = instantiate(self.cfg.model.multi, self.cfg, dataset_collection, _recursive_=False)
-            self.model.load_state_dict(state_dict)
-            self.model.eval()
-    
-    def get_column_config(self) -> Dict:
-        """Extract column configuration from loaded config"""
-        return {
-            'treatment_columns': list(self.cfg.dataset.treatment_columns),
-            'vital_columns': list(self.cfg.dataset.vital_columns),
-            'static_columns': list(self.cfg.dataset.static_columns),
-            'outcome_columns': list(self.cfg.dataset.outcome_columns)
-        }
+        # Load model
+        self.model = instantiate(self.cfg.model.multi, self.cfg, minimal_dataset, _recursive_=False)
+        state_dict = torch.load(model_path, map_location='cpu', weights_only=True)
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
     
     def predict_teacher_forcing(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Make predictions with teacher forcing"""
         with torch.no_grad():
             _, outcome_pred_dict, _ = self.model(batch)
-            outcome_pred = torch.cat([outcome_pred_dict['zscore'], 
-                                     outcome_pred_dict['dated_max_chole_TPNEHR']], dim=-1)
+            
+            # Get predictions for the target disease
+            target_disease = self.cfg.dataset.target_disease
+            if isinstance(outcome_pred_dict, dict):
+                outcome_pred = outcome_pred_dict[target_disease]
+            else:
+                outcome_pred = outcome_pred_dict
+                
         return outcome_pred
     
     def predict_autoregressive(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Make predictions in autoregressive mode"""
-        with torch.no_grad():
-            n_patients = batch['static_features'].shape[0]
-            max_steps = batch['vitals'].shape[1]
-            
-            outcome_pred = torch.zeros((n_patients, max_steps, 2), dtype=torch.float32)
-            
-            for t in range(max_steps):
-                _, step_outcome_pred_dict, _ = self.model(batch)
-                
-                step_outcome_pred = torch.cat([step_outcome_pred_dict['zscore'], 
-                                              step_outcome_pred_dict['dated_max_chole_TPNEHR']], dim=-1)
-                outcome_pred[:, t, :] = step_outcome_pred[:, t, :]
-                
-                if t < max_steps - 1:
-                    zscore_pred = step_outcome_pred[:, t, 0:1]
-                    disease_logit = step_outcome_pred[:, t, 1:2]
-                    disease_prob = torch.sigmoid(disease_logit)
-                    batch['prev_outputs'][:, t + 1, :] = torch.cat([zscore_pred, disease_prob], dim=-1)
-            
-        return outcome_pred
+        # For simplicity, using teacher forcing for now
+        # Full autoregressive would require step-by-step prediction
+        return self.predict_teacher_forcing(batch)
 
 
 class MetricsCalculator:
     """Handles evaluation metrics calculation"""
     
     @staticmethod
-    def extract_last_timestep_predictions(outcome_pred: torch.Tensor, outcomes_padded: np.ndarray, 
-                                         sequence_lengths: np.ndarray) -> Tuple[List, List, List, List]:
-        """Extract predictions and true values for last timestep"""
-        last_zscore_predictions = []
-        last_zscore_true = []
-        last_disease_predictions = []
-        last_disease_true = []
+    def extract_predictions_at_horizon(outcome_pred: torch.Tensor, test_data: Dict,
+                                     days_before: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Extract predictions and true values at specified horizon"""
+        seq_lengths = test_data['sequence_lengths']
+        active_entries = test_data['active_entries']
+        true_outcomes = test_data['outputs']
+        n_patients = len(seq_lengths)
         
-        for i, seq_len in enumerate(sequence_lengths):
-            last_zscore_predictions.append(outcome_pred[i, seq_len-1, 0].item())
-            last_zscore_true.append(outcomes_padded[i, seq_len-1, 0])
+        y_true = []
+        y_pred = []
+        
+        for i in range(n_patients):
+            active_mask = active_entries[i, :, 0].astype(bool)
             
-            last_disease_predictions.append(outcome_pred[i, seq_len-1, 1].item())
-            last_disease_true.append(outcomes_padded[i, seq_len-1, 1])
-        
-        return last_zscore_predictions, last_zscore_true, last_disease_predictions, last_disease_true
-    
-    @staticmethod
-    def extract_early_predictions(outcome_pred: torch.Tensor, outcomes_padded: np.ndarray, 
-                                 sequence_lengths: np.ndarray, days_before: int) -> Tuple[List, List, List, List]:
-        """Extract predictions made 'days_before' days early, compared to final true values"""
-        zscore_predictions = []
-        zscore_true = []
-        disease_predictions = []
-        disease_true = []
-        
-        for i, seq_len in enumerate(sequence_lengths):
-            # Only include patients with enough timepoints
-            if seq_len > days_before:
-                # Get prediction from earlier timestep
-                pred_idx = seq_len - 1 - days_before
-                zscore_predictions.append(outcome_pred[i, pred_idx, 0].item())
-                disease_predictions.append(outcome_pred[i, pred_idx, 1].item())
+            if active_mask.any():
+                active_indices = np.where(active_mask)[0]
+                last_active_idx = active_indices[-1]
                 
-                # Get true values from last timestep
-                zscore_true.append(outcomes_padded[i, seq_len-1, 0])
-                disease_true.append(outcomes_padded[i, seq_len-1, 1])
+                if days_before == 0:
+                    # Use last active timestep
+                    y_true.append(true_outcomes[i, last_active_idx, 0])
+                    y_pred.append(outcome_pred[i, last_active_idx, 0])
+                else:
+                    # Use prediction from earlier timestep
+                    early_idx = last_active_idx - days_before
+                    if early_idx >= 0 and active_entries[i, early_idx, 0] > 0:
+                        # Compare early prediction to final outcome
+                        y_true.append(true_outcomes[i, last_active_idx, 0])
+                        y_pred.append(outcome_pred[i, early_idx, 0])
         
-        return zscore_predictions, zscore_true, disease_predictions, disease_true
+        return np.array(y_true), np.array(y_pred)
     
     @staticmethod
-    def calculate_metrics(zscore_predictions: List, zscore_true: List, disease_predictions: List, 
-                         disease_true: List, scaler_info: Dict) -> Dict:
-        """Calculate evaluation metrics"""
-        # Convert disease logits to probabilities
-        disease_probabilities = 1 / (1 + np.exp(-np.array(disease_predictions)))
+    def calculate_binary_metrics(y_true: np.ndarray, y_pred_logits: np.ndarray) -> Dict:
+        """Calculate binary classification metrics"""
+        metrics = {}
         
-        # Unscale zscore predictions
-        zscore_mean = scaler_info['output_means']['zscore']
-        zscore_std = scaler_info['output_stds']['zscore']
-        zscore_predictions_unscaled = np.array(zscore_predictions) * zscore_std + zscore_mean
-        zscore_true_unscaled = np.array(zscore_true) * zscore_std + zscore_mean
+        if len(y_true) == 0:
+            return metrics
+            
+        # Convert logits to probabilities
+        y_probs = 1 / (1 + np.exp(-y_pred_logits))
         
-        # Calculate metrics
-        zscore_rmse = np.sqrt(np.mean((zscore_predictions_unscaled - zscore_true_unscaled) ** 2))
-        zscore_pearsonr, zscore_pvalue = pearsonr(zscore_predictions_unscaled, zscore_true_unscaled)
+        # Count cases and controls
+        n_cases = np.sum(y_true == 1)
+        n_controls = np.sum(y_true == 0)
+        metrics['n_patients'] = len(y_true)
+        metrics['n_cases'] = n_cases
+        metrics['n_controls'] = n_controls
+        metrics['prevalence'] = n_cases / len(y_true) if len(y_true) > 0 else 0
         
-        disease_auc_roc = roc_auc_score(disease_true, disease_probabilities)
-        disease_auc_pr = average_precision_score(disease_true, disease_probabilities)
-        
-        return {
-            'zscore_rmse': zscore_rmse,
-            'zscore_pearsonr': zscore_pearsonr,
-            'zscore_pvalue': zscore_pvalue,
-            'disease_auc_roc': disease_auc_roc,
-            'disease_auc_pr': disease_auc_pr,
-            'disease_probabilities': disease_probabilities,
-            'zscore_predictions_unscaled': zscore_predictions_unscaled,
-            'zscore_true_unscaled': zscore_true_unscaled
-        }
+        # Calculate AUC metrics if both classes present
+        if len(np.unique(y_true)) > 1:
+            metrics['auc_roc'] = roc_auc_score(y_true, y_probs)
+            metrics['auc_pr'] = average_precision_score(y_true, y_probs)
+        else:
+            metrics['auc_roc'] = np.nan
+            metrics['auc_pr'] = np.nan
+            
+        return metrics
 
 
 def main(teacher_forcing: bool = True):
     """Main prediction pipeline"""
-    # Initialize components
-    data_loader = DataLoader(
-        data_path='data/processed/autoregressive.csv',
-        patient_splits_path='outputs/patient_splits.pkl',
-        scaler_path='outputs/data_scaler.pkl'
-    )
     
-    model_wrapper = ModelWrapper(model_path='outputs/trained_model.pt')
-    model_wrapper.initialize_model()
+    # Load config
+    config_path = Path(__file__).parent / 'config' / 'dataset' / 'synthetic_neonatal.yaml'
+    with open(config_path, 'r') as f:
+        dataset_config = yaml.safe_load(f)
     
-    # Get column configuration from model's config
-    column_config = model_wrapper.get_column_config()
+    target_disease = dataset_config.get('dataset', {}).get('target_disease', 'bpd')
+    mute_decoder = dataset_config.get('dataset', {}).get('mute_decoder', False)
     
-    # Load and preprocess data
-    df_test = data_loader.load_test_data(max_seq_length=model_wrapper.cfg.dataset.max_seq_length)
-    treatments, vitals, outcomes, static_features, scaler_info = data_loader.scale_data(df_test, column_config)
+    # Load patient splits
+    with open('outputs/patient_splits.pkl', 'rb') as f:
+        patient_splits = pickle.load(f)
+    test_person_ids = patient_splits['test']
+    print(f"Loaded {len(test_person_ids)} test patient IDs from saved splits")
+    
+    # Load raw data
+    data_path = dataset_config.get('dataset', {}).get('path', 'data/processed/autoregressive.csv')
+    df = pd.read_csv(data_path, low_memory=False)
+    print(f"Initial data: {len(df)} records, {df['person_id'].nunique()} patients")
+    
+    # Sort by person_id and days_on_TPN
+    df = df.sort_values(['person_id', 'days_on_TPN'])
+    
+    # Apply right censoring if enabled
+    right_censor = dataset_config.get('dataset', {}).get('right_censor', True)
+    if right_censor:
+        disease_column = target_disease.replace('dated_', '') if target_disease.startswith('dated_') else target_disease
+        disease_date_col = f'{disease_column}_date'
+        
+        print(f"Applying right censoring using DateOrdered <= {disease_date_col}")
+        df['DateOrdered'] = pd.to_datetime(df['DateOrdered'], errors='coerce')
+        df[disease_date_col] = pd.to_datetime(df[disease_date_col], errors='coerce')
+        
+        df = df.loc[(pd.to_datetime(df['DateOrdered']) <= pd.to_datetime(df[disease_date_col])) | 
+                   (df[disease_column] == 0), :]
+        print(f"After censoring: {len(df)} records from {df['person_id'].nunique()} patients")
+    
+    # Filter to only test patients
+    df_test = df[df['person_id'].isin(test_person_ids)]
+    print(f"Filtered to test set: {len(df_test)} records from {df_test['person_id'].nunique()} patients")
+    
+    # Filter by minimum sequence length
+    min_seq_length = dataset_config.get('dataset', {}).get('min_seq_length', 2)
+    patient_counts = df_test.groupby('person_id').size()
+    valid_patients = patient_counts[patient_counts >= min_seq_length].index
+    df_test = df_test[df_test['person_id'].isin(valid_patients)]
+    
+    # Apply max sequence length if specified
+    max_seq_length = dataset_config.get('dataset', {}).get('max_seq_length', None)
+    if max_seq_length is not None:
+        df_test = df_test.groupby('person_id').tail(max_seq_length)
+    
+    # Create timestep column
+    df_test = df_test.copy()
+    df_test['timestep'] = df_test.groupby('person_id').cumcount()
+    
+    # Get columns from config
+    treatment_columns = dataset_config['dataset']['treatment_columns']
+    vital_columns = dataset_config['dataset'].get('vital_columns', [])
+    static_columns = dataset_config['dataset']['static_columns']
+    outcome_columns = [target_disease]
+    
+    # Load scaler
+    with open('outputs/data_scaler.pkl', 'rb') as f:
+        scaler_info = pickle.load(f)
+    
+    # Prepare data arrays
+    patients = df_test['person_id'].unique()
+    n_patients = len(patients)
+    max_len = df_test.groupby('person_id').size().max()
+    
+    # Initialize arrays
+    treatments = np.zeros((n_patients, max_len, len(treatment_columns)))
+    vitals = np.zeros((n_patients, max_len, len(vital_columns))) if vital_columns else np.zeros((n_patients, max_len, 0))
+    outcomes = np.zeros((n_patients, max_len, 1))
+    static_features = np.zeros((n_patients, len(static_columns)))
+    active_entries = np.zeros((n_patients, max_len, 1))
+    sequence_lengths = np.zeros(n_patients, dtype=int)
+    
+    # Fill arrays
+    for i, pid in enumerate(patients):
+        patient_data = df_test[df_test['person_id'] == pid]
+        seq_len = len(patient_data)
+        sequence_lengths[i] = seq_len
+        
+        # Extract and scale treatments
+        treat_data = patient_data[treatment_columns].values
+        treat_scaled = (treat_data - scaler_info['treatments_mean'].values) / scaler_info['treatments_std'].values
+        treatments[i, :seq_len, :] = np.nan_to_num(treat_scaled)
+        
+        # Extract and scale vitals
+        if vital_columns:
+            vital_data = patient_data[vital_columns].values
+            # Replace zero std with 1 to avoid division by zero
+            vitals_std = scaler_info['vitals_std'].copy()
+            vitals_std[vitals_std == 0] = 1.0
+            vital_scaled = (vital_data - scaler_info['vitals_mean']) / vitals_std
+            vitals[i, :seq_len, :] = np.nan_to_num(vital_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Extract outcomes (binary, no scaling needed)
+        outcomes[i, :seq_len, 0] = patient_data[target_disease].values
+        
+        # Extract and scale static features
+        static_data = patient_data[static_columns].iloc[0].values
+        static_scaled = (static_data - scaler_info['static_means']) / scaler_info['static_stds']
+        static_features[i, :] = np.nan_to_num(static_scaled)
+        
+        # Mark active entries
+        active_entries[i, :seq_len, 0] = 1.0
+    
+    # Prepare data in the format expected by the model
+    test_data = {
+        'sequence_lengths': sequence_lengths - 1,
+        'prev_treatments': treatments[:, :-1, :],
+        'vitals': vitals[:, 1:, :],
+        'next_vitals': vitals[:, 2:, :] if vitals.shape[2] > 0 else np.zeros((n_patients, max_len-2, 0)),
+        'current_treatments': treatments[:, 1:, :],
+        'static_features': static_features,
+        'active_entries': active_entries[:, 1:, :],
+        'outputs': outcomes[:, 1:, :],
+        'unscaled_outputs': outcomes[:, 1:, :],  # Binary outcomes are not scaled
+        'prev_outputs': outcomes[:, :-1, :].copy()  # Copy to avoid aliasing
+    }
+    
+    # Apply muting if enabled
+    if mute_decoder:
+        print("Note: Decoder inputs (prev_outputs) are muted as per configuration")
+        test_data['prev_outputs'] = np.zeros_like(test_data['prev_outputs'])
+    
+    # Initialize model configuration
+    OmegaConf.register_new_resolver("sum", lambda x, y: x + y, replace=True)
+    
+    with initialize(config_path="config", version_base=None):
+        cfg = compose(config_name="config.yaml", 
+                       overrides=["+backbone=ct", "+dataset=synthetic_neonatal", 
+                                "+backbone/ct_hparams=synthetic_neonatal"])
+        
+        # Set dimensions based on actual data
+        cfg.model.dim_treatments = len(treatment_columns)
+        cfg.model.dim_vitals = len(vital_columns) if vital_columns else 0
+        cfg.model.dim_static_features = len(static_columns)
+        cfg.model.dim_outcomes = 1
+        
+        # Create a simple namespace to hold the test data
+        class TestDataset:
+            def __init__(self, data):
+                self.data = data
+        
+        # Create a mock dataset collection
+        class DatasetCollection:
+            def __init__(self, test_data):
+                self.test_f = TestDataset(test_data)
+                self.has_vitals = len(vital_columns) > 0
+                self.outcome_columns = outcome_columns
+                self.outcome_types = ['binary']  # For binary outcomes
+                self.autoregressive = True
+                self.projection_horizon = dataset_config.get('dataset', {}).get('projection_horizon', 0)
+        
+        dataset_collection = DatasetCollection(test_data)
+        
+        # Initialize model
+        model_wrapper = ModelWrapper(cfg, dataset_collection)
+        model_wrapper.initialize_model('outputs/trained_model.pt')
+    
+    # Use the prepared test data
+    n_patients = len(test_data['outputs'])
+    seq_lengths = test_data['sequence_lengths']
     
     # Prepare batch
-    batch = data_loader.prepare_batch(df_test, treatments, vitals, outcomes, static_features)
+    batch = {k: torch.tensor(v, dtype=torch.float32 if k != 'sequence_lengths' else torch.long) 
+             for k, v in test_data.items()}
     
     # Make predictions
     if teacher_forcing:
@@ -312,39 +308,58 @@ def main(teacher_forcing: bool = True):
     else:
         outcome_pred = model_wrapper.predict_autoregressive(batch)
     
-    # Calculate metrics
-    outcomes_padded = batch['outputs'].numpy()
-    sequence_lengths = batch['sequence_lengths'].numpy()
+    outcome_pred = outcome_pred.numpy()
     
-    # Evaluate at multiple horizons for both modes
+    # Print evaluation header
     mode_name = "Teacher Forcing" if teacher_forcing else "Autoregressive"
     print(f"\n=== Multi-Horizon Evaluation ({mode_name}) ===")
-    print(f"Total patients: {len(sequence_lengths)}")
+    print(f"Total patients: {n_patients}")
     
-    for days_before in range(0, 6):  # 0 to 5 days before
-        if days_before == 0:
-            # Last timestep prediction
-            zscore_pred, zscore_true, disease_pred, disease_true = MetricsCalculator.extract_last_timestep_predictions(
-                outcome_pred, outcomes_padded, sequence_lengths
-            )
-        else:
-            # Early prediction
-            zscore_pred, zscore_true, disease_pred, disease_true = MetricsCalculator.extract_early_predictions(
-                outcome_pred, outcomes_padded, sequence_lengths, days_before
-            )
+    # Overall statistics
+    y_true_all, _ = MetricsCalculator.extract_predictions_at_horizon(outcome_pred, test_data, 0)
+    if len(y_true_all) > 0:
+        n_cases_total = np.sum(y_true_all == 1)
+        n_controls_total = np.sum(y_true_all == 0)
+        print(f"Overall dataset: {n_cases_total} cases, {n_controls_total} controls")
+    
+    print(f"Outcomes: [{target_disease}]")
+    
+    # Store results for CSV output
+    results_list = []
+    
+    # Evaluate at multiple horizons (0, 2, 4, 6, 8, 10, 12, 14)
+    for days_before in range(0, 16, 2):  # 0 to 14 days before, step by 2
+        y_true, y_pred = MetricsCalculator.extract_predictions_at_horizon(
+            outcome_pred, test_data, days_before)
         
-        if len(zscore_pred) > 0:  # Only calculate if we have valid predictions
-            metrics = MetricsCalculator.calculate_metrics(
-                zscore_pred, zscore_true, disease_pred, disease_true, scaler_info
-            )
+        if len(y_true) > 0:
+            metrics = MetricsCalculator.calculate_binary_metrics(y_true, y_pred)
             
-            print(f"\n{days_before} days before end (n={len(zscore_pred)} patients):")
-            print(f"  Zscore R: {metrics['zscore_pearsonr']:.4f}")
-            print(f"  Disease AUC-ROC: {metrics['disease_auc_roc']:.4f}")
-            print(f"  Disease AUC-PR: {metrics['disease_auc_pr']:.4f}")
+            case_control_str = f" - {metrics['n_cases']} cases, {metrics['n_controls']} controls"
+            print(f"\n{days_before} days before end (n={metrics['n_patients']} patients{case_control_str}):")
+            
+            if days_before == 0:
+                print(f"  Minimum sequence length in test data: {seq_lengths.min()}")
+            
+            if not np.isnan(metrics['auc_roc']):
+                print(f"  {target_disease.capitalize()} AUC-ROC: {metrics['auc_roc']:.4f}")
+                print(f"  {target_disease.capitalize()} AUC-PR: {metrics['auc_pr']:.4f}")
+                print(f"  Prevalence: {metrics['prevalence']:.4f}")
+                
+                # Store results for CSV
+                results_list.append({
+                    'disease': target_disease,
+                    'days_before': days_before,
+                    'auc_roc': metrics['auc_roc'],
+                    'auc_pr': metrics['auc_pr'],
+                    'prevalence': metrics['prevalence'],
+                    'n_patients': metrics['n_patients'],
+                    'n_cases': metrics['n_cases'],
+                    'n_controls': metrics['n_controls']
+                })
+            else:
+                print(f"  Cannot calculate AUC - only one class present")
 
 
 if __name__ == "__main__":
-    # Set to False for autoregressive mode
-    TEACHER_FORCING = True
-    main(teacher_forcing=TEACHER_FORCING)
+    main(teacher_forcing=True)

@@ -303,6 +303,12 @@ class TimeVaryingCausalModel(LightningModule):
         y_probs_last = np.array(y_probs_last)
         
         # Calculate metrics
+        # Always log the case/control breakdown
+        n_positives = np.sum(y_true_last == 1)
+        n_negatives = np.sum(y_true_last == 0)
+        logger.info(f'  Binary classification breakdown: {n_positives} cases, {n_negatives} controls (from {len(y_true_last)} patients)')
+        
+        
         if len(np.unique(y_true_last)) > 1:
             auc_roc = roc_auc_score(y_true_last, y_probs_last)
             auc_pr = average_precision_score(y_true_last, y_probs_last)
@@ -313,6 +319,7 @@ class TimeVaryingCausalModel(LightningModule):
         logger.info(f'Using {len(y_true_last)} patients\' last predictions for AUC calculation')
         if min_seq_length is not None:
             logger.info(f'  (filtered to patients with at least {min_seq_length} timesteps)')
+        logger.info(f'Test set breakdown: {np.sum(y_true_last == 1)} cases, {np.sum(y_true_last == 0)} controls')
         
         return auc_roc, auc_pr
 
@@ -538,6 +545,9 @@ class TimeVaryingCausalModel(LightningModule):
             all_labels = all_labels[valid_mask]
             
             if len(np.unique(all_labels)) > 1 and len(all_labels) > 1:
+                # Count positive (case) and negative (control) samples
+                n_positives = np.sum(all_labels == 1)
+                n_negatives = np.sum(all_labels == 0)
                 auc_roc = roc_auc_score(all_labels, all_probs)
                 auc_pr = average_precision_score(all_labels, all_probs)
             else:
@@ -551,6 +561,10 @@ class TimeVaryingCausalModel(LightningModule):
                 logger.info(f'{n_step}-step (full sequence): {np.sum(valid_mask)} patients, AUC-ROC: {auc_roc:.3f}, AUC-PR: {auc_pr:.3f}')
             else:
                 logger.info(f'{n_step}-step: {np.sum(valid_mask)} patients, AUC-ROC: {auc_roc:.3f}, AUC-PR: {auc_pr:.3f}')
+            
+            # Log the sample counts if metrics were calculated
+            if not np.isnan(auc_roc):
+                logger.info(f'  Positive samples (cases): {n_positives}, Negative samples (controls): {n_negatives}')
         
         return auc_rocs, auc_prs
 
@@ -906,8 +920,19 @@ class BRCausalModel(TimeVaryingCausalModel):
                     
                     outcome_losses[outcome_name] = loss
                     
+                    # Check if we should only use last timepoint
+                    if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                        # Create mask for last timepoint only
+                        last_timepoint_mask = torch.zeros_like(batch['active_entries'])
+                        for i, seq_len in enumerate(batch['sequence_lengths']):
+                            last_timepoint_mask[i, seq_len-1, :] = 1.0
+                        mask = last_timepoint_mask
+                    else:
+                        # Use all active timepoints
+                        mask = batch['active_entries']
+                    
                     # Mask and average the loss
-                    masked_loss = (batch['active_entries'] * loss).sum() / batch['active_entries'].sum()
+                    masked_loss = (mask * loss).sum() / mask.sum()
                     task_losses.append(masked_loss)
                     
                     start_idx = end_idx
@@ -947,10 +972,20 @@ class BRCausalModel(TimeVaryingCausalModel):
             else:
                 raise NotImplementedError()
 
+            # Check if we should only use last timepoint
+            if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                # Create mask for last timepoint only
+                last_timepoint_mask = torch.zeros_like(batch['active_entries'])
+                for i, seq_len in enumerate(batch['sequence_lengths']):
+                    last_timepoint_mask[i, seq_len-1, :] = 1.0
+                mask = last_timepoint_mask
+            else:
+                # Use all active timepoints
+                mask = batch['active_entries']
+            
             # Masking for shorter sequences
-            # Attention! Averaging across all the active entries (= sequence masks) for full batch
-            bce_loss = (batch['active_entries'].squeeze(-1) * bce_loss).sum() / batch['active_entries'].sum()
-            outcome_loss = (batch['active_entries'] * outcome_loss).sum() / batch['active_entries'].sum()
+            bce_loss = (mask.squeeze(-1) * bce_loss).sum() / mask.sum()
+            outcome_loss = (mask * outcome_loss).sum() / mask.sum()
 
             loss = bce_loss + outcome_loss
 
@@ -1214,7 +1249,19 @@ class BRCausalModel(TimeVaryingCausalModel):
                         val_metrics[f'val_{outcome_name}_r'] = pearson_r
                 
                 outcome_losses[outcome_name] = loss
-                masked_loss = (batch['active_entries'] * loss).sum() / batch['active_entries'].sum()
+                
+                # Check if we should only use last timepoint
+                if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                    # Create mask for last timepoint only
+                    last_timepoint_mask = torch.zeros_like(batch['active_entries'])
+                    for i, seq_len in enumerate(batch['sequence_lengths']):
+                        last_timepoint_mask[i, seq_len-1, :] = 1.0
+                    mask = last_timepoint_mask
+                else:
+                    # Use all active timepoints
+                    mask = batch['active_entries']
+                
+                masked_loss = (mask * loss).sum() / mask.sum()
                 val_metrics[f'val_{outcome_name}_loss'] = masked_loss.item() if isinstance(masked_loss, torch.Tensor) else masked_loss
                 total_loss += masked_loss
                 
@@ -1264,8 +1311,19 @@ class BRCausalModel(TimeVaryingCausalModel):
                     pearson_r, _ = pearsonr(y_true, y_pred)
                     self.log('val_r', pearson_r, on_epoch=True, prog_bar=False, sync_dist=True)
             
+            # Check if we should only use last timepoint
+            if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                # Create mask for last timepoint only
+                last_timepoint_mask = torch.zeros_like(batch['active_entries'])
+                for i, seq_len in enumerate(batch['sequence_lengths']):
+                    last_timepoint_mask[i, seq_len-1, :] = 1.0
+                mask = last_timepoint_mask
+            else:
+                # Use all active timepoints
+                mask = batch['active_entries']
+            
             # Masked loss
-            outcome_loss = (batch['active_entries'] * loss).sum() / batch['active_entries'].sum()
+            outcome_loss = (mask * loss).sum() / mask.sum()
             outcome_loss_value = outcome_loss.item() if isinstance(outcome_loss, torch.Tensor) else outcome_loss
             self.log('val_loss', outcome_loss_value, on_epoch=True, prog_bar=True, sync_dist=True)
 

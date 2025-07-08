@@ -7,7 +7,7 @@ from hydra.utils import instantiate
 from torch.utils.data import DataLoader
 from pytorch_lightning import Trainer
 from pytorch_lightning.utilities.seed import seed_everything
-from pytorch_lightning.callbacks import LearningRateMonitor
+from pytorch_lightning.callbacks import LearningRateMonitor, EarlyStopping, ModelCheckpoint
 
 from src.models.utils import AlphaRise, FilteringMlFlowLogger
 from src.models.time_varying_model import LossBreakdownCallback, GradNormCallback
@@ -15,6 +15,10 @@ from src.models.time_varying_model import LossBreakdownCallback, GradNormCallbac
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 torch.set_default_dtype(torch.double)
+
+# Set specific loggers to higher level to reduce output
+logging.getLogger('src.data').setLevel(logging.WARNING)
+logging.getLogger('src.models').setLevel(logging.WARNING)
 
 
 @hydra.main(config_name=f'config.yaml', config_path='../config/')
@@ -32,22 +36,65 @@ def main(args: DictConfig):
     # Non-strict access to fields
     OmegaConf.set_struct(args, False)
     OmegaConf.register_new_resolver("sum", lambda x, y: x + y, replace=True)
-    logger.info('\n' + OmegaConf.to_yaml(args, resolve=True))
-
+    
+    # Set dimension values based on column lists before resolving config
+    if hasattr(args.dataset, 'treatment_columns'):
+        args.model.dim_treatments = len(args.dataset.treatment_columns)
+    if hasattr(args.dataset, 'vital_columns'):
+        args.model.dim_vitals = len(args.dataset.vital_columns)
+    if hasattr(args.dataset, 'static_columns'):
+        args.model.dim_static_features = len(args.dataset.static_columns)
+    
+    # Comment out verbose config logging
+    # logger.info('\n' + OmegaConf.to_yaml(args, resolve=True))
+    
     # Initialisation of data
     seed_everything(args.exp.seed)
     dataset_collection = instantiate(args.dataset, _recursive_=True)
     dataset_collection.process_data_multi()
+    
+    # Mute decoder inputs if enabled
+    if hasattr(args.dataset, 'mute_decoder') and args.dataset.mute_decoder:
+        logger.info("Muting decoder inputs (autoregressive outputs) during training")
+        # Zero out all autoregressive outputs in training data - use copy to avoid affecting original outcomes
+        dataset_collection.train_f.data['prev_outputs'] = np.zeros_like(dataset_collection.train_f.data['prev_outputs'])
+        # Zero out in validation data
+        dataset_collection.val_f.data['prev_outputs'] = np.zeros_like(dataset_collection.val_f.data['prev_outputs'])
+        # Zero out in test data if it exists
+        if hasattr(dataset_collection, 'test_f'):
+            dataset_collection.test_f.data['prev_outputs'] = np.zeros_like(dataset_collection.test_f.data['prev_outputs'])
     # Set dim_outcomes - only override if not already set in config
     if not hasattr(args.model, 'dim_outcomes') or args.model.dim_outcomes == '???':
         args.model.dim_outcomes = dataset_collection.train_f.data['outputs'].shape[-1]
     # Otherwise keep the value from config (which could be a list)
+    # Double-check dimensions match the actual data
     args.model.dim_treatments = dataset_collection.train_f.data['current_treatments'].shape[-1]
     args.model.dim_vitals = dataset_collection.train_f.data['vitals'].shape[-1] if dataset_collection.has_vitals else 0
     args.model.dim_static_features = dataset_collection.train_f.data['static_features'].shape[-1]
 
     # Train_callbacks
     multimodel_callbacks = [AlphaRise(rate=args.exp.alpha_rate), LossBreakdownCallback()]
+    
+    # Add model checkpoint callback to save best model
+    checkpoint_callback = ModelCheckpoint(
+        monitor='val_loss',
+        dirpath='outputs/checkpoints',
+        filename='best-model-{epoch:02d}-{val_loss:.3f}',
+        save_top_k=1,
+        mode='min',
+        save_weights_only=True
+    )
+    multimodel_callbacks.append(checkpoint_callback)
+    
+    # Add early stopping callback
+    early_stopping = EarlyStopping(
+        monitor='val_loss',
+        min_delta=0.001,  # Minimum change of 0.001 to qualify as an improvement
+        patience=5,       # Number of epochs with no improvement after which training will be stopped
+        verbose=True,
+        mode='min'        # For loss, we want to minimize
+    )
+    multimodel_callbacks.append(early_stopping)
     
     # Add GradNorm callback if enabled
     if hasattr(args.dataset, 'use_gradnorm') and args.dataset.use_gradnorm:
@@ -80,6 +127,18 @@ def main(args: DictConfig):
     root_dir = Path(__file__).parent.parent
     output_dir = root_dir / 'outputs'
     output_dir.mkdir(exist_ok=True)
+    
+    # Check if we have a best model from checkpoint
+    if checkpoint_callback.best_model_path:
+        # Load best model weights
+        checkpoint = torch.load(checkpoint_callback.best_model_path, weights_only=False)
+        # PyTorch Lightning checkpoint contains state_dict as a key
+        if 'state_dict' in checkpoint:
+            multimodel.load_state_dict(checkpoint['state_dict'])
+        else:
+            multimodel.load_state_dict(checkpoint)
+        logger.info(f"Loaded best model from epoch with val_loss={checkpoint_callback.best_model_score:.4f}")
+    
     torch.save(multimodel.state_dict(), output_dir / 'trained_model.pt')
     logger.info(f"Saved trained model to {output_dir / 'trained_model.pt'}")
 
@@ -93,14 +152,11 @@ def main(args: DictConfig):
     
     if hasattr(dataset_collection, 'outcome_types'):
         # Multiple outcomes - calculate metrics for each
-        use_one_seq_per_patient = getattr(dataset_collection, 'one_seq_per_patient_eval', False)
-        min_seq_length = (dataset_collection.projection_horizon + 1 + 1) if use_one_seq_per_patient else None
-        
         for i, (outcome_name, otype) in enumerate(zip(dataset_collection.outcome_columns, dataset_collection.outcome_types)):
             if otype == 'binary':
                 # Extract predictions for this specific outcome
                 val_auc_roc, val_auc_pr = multimodel.get_binary_classification_metrics(
-                    dataset_collection.val_f, min_seq_length=min_seq_length, outcome_idx=i)
+                    dataset_collection.val_f, outcome_idx=i)
                 logger.info(f'Val {outcome_name} AUC-ROC: {val_auc_roc}; AUC-PR: {val_auc_pr}')
                 val_metrics[f'val_{outcome_name}_auc_roc'] = val_auc_roc
                 val_metrics[f'val_{outcome_name}_auc_pr'] = val_auc_pr
@@ -114,9 +170,7 @@ def main(args: DictConfig):
     else:
         # Single outcome - original behavior
         if hasattr(dataset_collection, 'outcome_type') and dataset_collection.outcome_type == 'binary':
-            use_one_seq_per_patient = getattr(dataset_collection, 'one_seq_per_patient_eval', False)
-            min_seq_length = (dataset_collection.projection_horizon + 1 + 1) if use_one_seq_per_patient else None
-            val_auc_roc, val_auc_pr = multimodel.get_binary_classification_metrics(dataset_collection.val_f, min_seq_length=min_seq_length)
+            val_auc_roc, val_auc_pr = multimodel.get_binary_classification_metrics(dataset_collection.val_f)
             logger.info(f'Val AUC-ROC: {val_auc_roc}; Val AUC-PR: {val_auc_pr}')
             val_rmse_orig, val_rmse_all = None, None
         else:
@@ -140,8 +194,48 @@ def main(args: DictConfig):
             for i, (outcome_name, otype) in enumerate(zip(dataset_collection.outcome_columns, dataset_collection.outcome_types)):
                 if otype == 'binary':
                     test_auc_roc, test_auc_pr = multimodel.get_binary_classification_metrics(
-                        dataset_collection.test_f, min_seq_length=min_seq_length, outcome_idx=i)
+                        dataset_collection.test_f, outcome_idx=i)
+                    
+                    # Get the ground truth used for AUC calculation
+                    test_data = dataset_collection.test_f.data
+                    seq_lengths = test_data['sequence_lengths'] if isinstance(test_data['sequence_lengths'], np.ndarray) else test_data['sequence_lengths'].numpy()
+                    active_entries = test_data['active_entries'] if isinstance(test_data['active_entries'], np.ndarray) else test_data['active_entries'].numpy()
+                    outcomes = test_data['outputs'][:, :, i] if isinstance(test_data['outputs'], np.ndarray) else test_data['outputs'][:, :, i].numpy()
+                    
+                    # Get last active outcome for each patient (same logic as in get_binary_classification_metrics)
+                    y_true_last = []
+                    positive_patients = []
+                    for j in range(len(seq_lengths)):
+                        active_mask = active_entries[j, :, 0].astype(bool)
+                        if active_mask.any():
+                            last_active_idx = np.where(active_mask)[0][-1]
+                            outcome_val = outcomes[j, last_active_idx]
+                            y_true_last.append(outcome_val)
+                            if outcome_val == 1:
+                                positive_patients.append((j, last_active_idx, seq_lengths[j]))
+                    
+                    
+                    
+                    # One-liner for case/control breakdown
+                    logger.info(f'Test {outcome_name}: {sum(y_true_last)} cases, {len(y_true_last) - sum(y_true_last)} controls (from {len(y_true_last)} patients)')
+                    logger.info(f'Minimum sequence length in test data: {seq_lengths.min()}')
                     logger.info(f'Test {outcome_name} AUC-ROC: {test_auc_roc}; AUC-PR: {test_auc_pr}')
+                    
+                    # Load patient splits to get actual person IDs
+                    import pickle
+                    from pathlib import Path
+                    from src import ROOT_PATH
+                    # Use ROOT_PATH to ensure we find the file regardless of working directory
+                    splits_path = Path(ROOT_PATH) / 'outputs' / 'patient_splits.pkl'
+                    if splits_path.exists():
+                        with open(splits_path, 'rb') as f:
+                            patient_splits = pickle.load(f)
+                        test_person_ids = patient_splits['test']
+                    else:
+                        logger.warning(f"Could not find patient splits file at {splits_path}")
+                        test_person_ids = list(range(len(y_true_last)))  # Use indices as fallback
+                    
+                    
                     encoder_results.update({
                         f'encoder_test_{outcome_name}_auc_roc': test_auc_roc,
                         f'encoder_test_{outcome_name}_auc_pr': test_auc_pr
