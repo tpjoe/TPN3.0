@@ -78,6 +78,15 @@ class BRTreatmentOutcomeHead(nn.Module):
         self.linear4 = nn.Linear(self.br_size + self.dim_treatments, self.fc_hidden_units)
         self.elu3 = nn.ELU()
         self.linear5 = nn.Linear(self.fc_hidden_units, self.dim_outcome)
+        
+        # Binary classification head for "ever disease" prediction
+        self.linear_binary = nn.Linear(self.br_size, 1)
+        
+        # Fourth head: binary classification with treatment input
+        # Output dimension matches number of buckets (same as hazard head)
+        self.linear6 = nn.Linear(self.br_size + self.dim_treatments, self.fc_hidden_units)
+        self.elu4 = nn.ELU()
+        self.linear7 = nn.Linear(self.fc_hidden_units, self.dim_outcome)
 
         self.treatment_head_params = ['linear2', 'linear3']
 
@@ -101,6 +110,18 @@ class BRTreatmentOutcomeHead(nn.Module):
     def build_br(self, seq_output):
         br = self.elu1(self.linear1(seq_output))
         return br
+    
+    def build_binary(self, br):
+        """Build binary classification output for 'ever disease' prediction"""
+        binary_logits = self.linear_binary(br)
+        return binary_logits
+    
+    def build_binary_with_treatment(self, br, current_treatment):
+        """Build fourth head: binary classification with treatment input"""
+        x = torch.cat((br, current_treatment), dim=-1)
+        x = self.elu4(self.linear6(x))
+        binary_treatment_logits = self.linear7(x)
+        return binary_treatment_logits
 
 
 class ROutcomeVitalsHead(nn.Module):

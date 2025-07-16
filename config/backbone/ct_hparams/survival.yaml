@@ -1,0 +1,23 @@
+# @package _global_
+model:
+  multi:
+    tune_hparams: false
+    optimizer:
+      learning_rate: 0.001
+    batch_size: 32
+    seq_hidden_units: 48  # Should be divisible by num_heads
+    br_size: 24
+    fc_hidden_units: 48
+    dropout_rate: 0.1
+    num_layer: 1
+    num_heads: 2
+    max_grad_norm: 1.0
+    
+    self_positional_encoding:
+      max_relative_position: 20
+
+exp:
+  weights_ema: True
+  alpha: 0.01
+  beta: 0.99
+  balancing: domain_confusion

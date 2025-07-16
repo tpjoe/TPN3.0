@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - ct
+
+model:
+  name: ct_survival
+  multi:
+    _target_: src.models.ct_survival.CTSurvival

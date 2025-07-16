@@ -2,9 +2,9 @@
 dataset:
   # Central disease configuration - change this to switch diseases
   # Options: bpd, nec, rop, death, max_chole_TPNEHR (or their dated_ versions)
-  target_disease: dated_as
-  _target_: src.data.synthetic_neonatal.SyntheticNeonatalDatasetCollection
-  name: synthetic_neonatal
+  target_disease: bpd
+  _target_: src.data.survival.SurvivalDatasetCollection
+  name: survival
   path: data/processed/autoregressive.csv  # Path to the CSV data file
   seed: ${exp.seed}  # Random seed for data splitting
   min_seq_length: 2  # Minimum sequence length to include in dataset
@@ -73,11 +73,20 @@ dataset:
   - ${dataset.target_disease}  # Disease outcome to predict
   outcome_types:
   - binary  # Type of outcome: binary or continuous
+  
+  # Hazard prediction configuration (CTSurvival always uses this)
+  # Define prediction horizons for sliding windows (only used when sliding_windows=true)
+  # Format: [name, start_day, end_day] for bucket-based prediction
+  horizons:
+    - ["immediate", 0, 1]      # Bucket 0: 0-1 days (immediate risk)
+    - ["eventual", 2, 50000]   # Bucket 1: 2-50000 days (long-term risk)
+  filter_bucket: null  # Filter to specific bucket name (e.g., "immediate", "eventual") or null for all buckets
+  # num_hazard_buckets: 3  # OPTIONAL - Automatically calculated as len(horizons) + 1
+  sliding_windows: false  # Create sliding windows for survival analysis
   sequence_id_column: person_id  # Column identifying unique patients
-  timestamp_column: days_on_TPN  # Column containing time information
+  timestamp_column: DateOrdered  # Column containing time information
   scaling: standard  # Feature scaling method: standard or minmax
   treatment_type: continuous  # Type of treatment features
-  right_censor: true  # Apply right censoring based on disease date
   outcome_shift: 0  # Shift outcomes by n timesteps (for next-step prediction)
   last_timepoint_only: true  # Only use last timestep for loss (seq2one vs seq2seq)
   min_length_filter: true  # Filter out sequences shorter than min_seq_length
@@ -85,17 +94,18 @@ dataset:
   split:
     val: 0.2
     test: 0.2
-  task_weights:
-    ${dataset.target_disease}: 1.0  # Weight for this task in multi-task learning
   use_gradnorm: false  # Enable GradNorm for automatic task weight balancing
   gradnorm_alpha: 1.5  # Alpha parameter for GradNorm (controls convergence speed)
-  mute_decoder: false  # Zero out autoregressive inputs to prevent data leakage
+  mute_decoder: true  # Zero out autoregressive inputs to prevent data leakage
+  focal_gamma: 0.0  # Focal loss gamma for handling imbalanced data (0=disabled, 2.0=recommended for imbalanced)
+  
+  # Binary classification only (no survival loss)
+  binary_loss_weight: 0.5  # Lambda: weight for binary classification loss (0-1). Total outcome loss = lambda * binary_bce + (1-lambda) * survival_loss. NOTE: Lambda is muted/ignored when use_gradnorm=True - GradNorm will dynamically learn task weights instead
 model:
   dim_treatments: ???
   dim_vitals: ???
   dim_static_features: ???
-  dim_outcomes:
-  - 1
+  dim_outcomes: ???
 exp:
   unscale_rmse:
     disease: false
