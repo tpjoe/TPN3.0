@@ -14,7 +14,7 @@ cmd = [
     "exp.gpus=null",  # Use CPU for local testing
     "exp.logging=False",
     "exp.seed=42",
-    "exp.max_epochs=2",
+    "exp.max_epochs=200",
     "dataset.sliding_windows=False",
     "dataset.binary_loss_weight=0.5"
 ]

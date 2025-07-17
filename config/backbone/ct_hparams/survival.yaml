@@ -1,10 +1,11 @@
 # @package _global_
 model:
+  use_ap_loss: false  # Use Average Precision Loss (APLoss) with SOAP optimizer for binary classification head instead of BCE
   multi:
     tune_hparams: false
     optimizer:
-      learning_rate: 0.001
-    batch_size: 32
+      learning_rate: 0.0005
+    batch_size: 64
     seq_hidden_units: 48  # Should be divisible by num_heads
     br_size: 24
     fc_hidden_units: 48

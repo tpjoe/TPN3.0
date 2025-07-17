@@ -146,6 +146,10 @@ def main(args: DictConfig):
     model_filename = 'trained_model_survival.pt'
     torch.save(multimodel.state_dict(), output_dir / model_filename)
     logger.info(f"Saved trained model to {output_dir / model_filename}")
+    
+    # Export predictions for subgroup analysis
+    logger.info("Exporting predictions for subgroup analysis...")
+    multimodel.export_predictions(dataset_collection.val_f, 'val')
 
     # Validation factual evaluation
     val_dataloader = DataLoader(dataset_collection.val_f, batch_size=args.dataset.val_batch_size, shuffle=False)
@@ -176,21 +180,61 @@ def main(args: DictConfig):
     
     # Calculate bucket-specific metrics for fourth head
     val_bucket_specific_metrics = multimodel.calculate_bucket_specific_metrics(dataset_collection.val_f, 'val')
-    logger.info(f"\nFinal Validation Binary + Treatment Metrics (Fourth Head - Bucket-Specific):")
-    logger.info(f"  Bucket 0 (immediate: 0-1 days):")
-    logger.info(f"    AUROC: {val_bucket_specific_metrics.get('val_bucket0_auc_roc', np.nan):.4f}")
-    logger.info(f"    AUPRC: {val_bucket_specific_metrics.get('val_bucket0_auc_pr', np.nan):.4f}")
-    logger.info(f"    Events: {val_bucket_specific_metrics.get('val_bucket0_n_events', 0)}")
-    logger.info(f"    Controls: {val_bucket_specific_metrics.get('val_bucket0_n_controls', 0)}")
-    logger.info(f"    Prevalence: {val_bucket_specific_metrics.get('val_bucket0_prevalence', 0):.2%}")
-    logger.info(f"  Bucket 1 (eventual: 2+ days):")
-    logger.info(f"    AUROC: {val_bucket_specific_metrics.get('val_bucket1_auc_roc', np.nan):.4f}")
-    logger.info(f"    AUPRC: {val_bucket_specific_metrics.get('val_bucket1_auc_pr', np.nan):.4f}")
-    logger.info(f"    Events: {val_bucket_specific_metrics.get('val_bucket1_n_events', 0)}")
-    logger.info(f"    Controls: {val_bucket_specific_metrics.get('val_bucket1_n_controls', 0)}")
-    logger.info(f"    At Risk: {val_bucket_specific_metrics.get('val_bucket1_n_at_risk', 0)}")
-    logger.info(f"    Excluded: {val_bucket_specific_metrics.get('val_bucket1_n_excluded', 0)}")
-    logger.info(f"    Prevalence: {val_bucket_specific_metrics.get('val_bucket1_prevalence', 0):.2%}")
+    logger.info(f"\nFinal Validation Binary + Treatment Metrics (Bucket-Specific Comparison):")
+    logger.info("  - AUROC/AUPRC (4th): Fourth head (survival with treatment)")
+    logger.info("  - AUROC/AUPRC (3rd): Third head (binary classification) on same patient group")
+    
+    # Get number of buckets from config
+    n_buckets = len(args.dataset.horizons) if hasattr(args.dataset, 'horizons') else 2
+    
+    # Build table header
+    header_row = "| Metric     |"
+    divider_row = "|------------|"
+    
+    # Collect bucket descriptions
+    bucket_descs = []
+    for b in range(n_buckets):
+        if hasattr(args.dataset, 'horizons') and b < len(args.dataset.horizons):
+            horizon = args.dataset.horizons[b]
+            bucket_desc = f"Bucket {b} ({horizon[1]}-{horizon[2]} days)"
+        else:
+            bucket_desc = f"Bucket {b}"
+        bucket_descs.append(bucket_desc)
+        header_row += f" {bucket_desc:<23} |"
+        divider_row += "-------------------------|"
+    
+    logger.info(header_row)
+    logger.info(divider_row)
+    
+    # Build metric rows
+    metrics = [
+        ("AUROC (4th)", "auc_roc", "{:.4f}"),
+        ("AUPRC (4th)", "auc_pr", "{:.4f}"),
+        ("AUROC (3rd)", "binary_auc_roc", "{:.4f}"),
+        ("AUPRC (3rd)", "binary_auc_pr", "{:.4f}"),
+        ("Events", "n_events", "{:d}"),
+        ("Controls", "n_controls", "{:d}"),
+        ("At Risk", "n_at_risk", "{:d}"),
+        ("Excluded", "n_excluded", "{:d}"),
+        ("Prevalence", "prevalence", "{:.2%}")
+    ]
+    
+    for metric_name, metric_key, format_str in metrics:
+        row = f"| {metric_name:<10} |"
+        for b in range(n_buckets):
+            key = f'val_bucket{b}_{metric_key}'
+            if metric_key in ["n_at_risk", "n_excluded"] and b == 0:
+                value_str = "-"
+            else:
+                value = val_bucket_specific_metrics.get(key, 0 if metric_key.startswith('n_') else np.nan)
+                if isinstance(value, (int, np.integer)):
+                    value_str = f"{value:d}"
+                elif metric_key == "prevalence":
+                    value_str = f"{value:.2%}"
+                else:
+                    value_str = format_str.format(value)
+            row += f" {value_str:<23} |"
+        logger.info(row)
     
     # Display bucket-specific metrics for validation
     if val_bucket_metrics:
@@ -257,21 +301,61 @@ def main(args: DictConfig):
         
         # Calculate bucket-specific metrics for fourth head
         test_bucket_specific_metrics = multimodel.calculate_bucket_specific_metrics(dataset_collection.test_f, 'test')
-        logger.info(f"\nTest Binary + Treatment Metrics (Fourth Head - Bucket-Specific):")
-        logger.info(f"  Bucket 0 (immediate: 0-1 days):")
-        logger.info(f"    AUROC: {test_bucket_specific_metrics.get('test_bucket0_auc_roc', np.nan):.4f}")
-        logger.info(f"    AUPRC: {test_bucket_specific_metrics.get('test_bucket0_auc_pr', np.nan):.4f}")
-        logger.info(f"    Events: {test_bucket_specific_metrics.get('test_bucket0_n_events', 0)}")
-        logger.info(f"    Controls: {test_bucket_specific_metrics.get('test_bucket0_n_controls', 0)}")
-        logger.info(f"    Prevalence: {test_bucket_specific_metrics.get('test_bucket0_prevalence', 0):.2%}")
-        logger.info(f"  Bucket 1 (eventual: 2+ days):")
-        logger.info(f"    AUROC: {test_bucket_specific_metrics.get('test_bucket1_auc_roc', np.nan):.4f}")
-        logger.info(f"    AUPRC: {test_bucket_specific_metrics.get('test_bucket1_auc_pr', np.nan):.4f}")
-        logger.info(f"    Events: {test_bucket_specific_metrics.get('test_bucket1_n_events', 0)}")
-        logger.info(f"    Controls: {test_bucket_specific_metrics.get('test_bucket1_n_controls', 0)}")
-        logger.info(f"    At Risk: {test_bucket_specific_metrics.get('test_bucket1_n_at_risk', 0)}")
-        logger.info(f"    Excluded: {test_bucket_specific_metrics.get('test_bucket1_n_excluded', 0)}")
-        logger.info(f"    Prevalence: {test_bucket_specific_metrics.get('test_bucket1_prevalence', 0):.2%}")
+        logger.info(f"\nTest Binary + Treatment Metrics (Bucket-Specific Comparison):")
+        logger.info("  - AUROC/AUPRC (4th): Fourth head (survival with treatment)")
+        logger.info("  - AUROC/AUPRC (3rd): Third head (binary classification) on same patient group")
+        
+        # Get number of buckets from config
+        n_buckets = len(args.dataset.horizons) if hasattr(args.dataset, 'horizons') else 2
+        
+        # Build table header
+        header_row = "| Metric     |"
+        divider_row = "|------------|"
+        
+        # Collect bucket descriptions
+        bucket_descs = []
+        for b in range(n_buckets):
+            if hasattr(args.dataset, 'horizons') and b < len(args.dataset.horizons):
+                horizon = args.dataset.horizons[b]
+                bucket_desc = f"Bucket {b} ({horizon[1]}-{horizon[2]} days)"
+            else:
+                bucket_desc = f"Bucket {b}"
+            bucket_descs.append(bucket_desc)
+            header_row += f" {bucket_desc:<23} |"
+            divider_row += "-------------------------|"
+        
+        logger.info(header_row)
+        logger.info(divider_row)
+        
+        # Build metric rows
+        metrics = [
+            ("AUROC (4th)", "auc_roc", "{:.4f}"),
+            ("AUPRC (4th)", "auc_pr", "{:.4f}"),
+            ("AUROC (3rd)", "binary_auc_roc", "{:.4f}"),
+            ("AUPRC (3rd)", "binary_auc_pr", "{:.4f}"),
+            ("Events", "n_events", "{:d}"),
+            ("Controls", "n_controls", "{:d}"),
+            ("At Risk", "n_at_risk", "{:d}"),
+            ("Excluded", "n_excluded", "{:d}"),
+            ("Prevalence", "prevalence", "{:.2%}")
+        ]
+        
+        for metric_name, metric_key, format_str in metrics:
+            row = f"| {metric_name:<10} |"
+            for b in range(n_buckets):
+                key = f'test_bucket{b}_{metric_key}'
+                if metric_key in ["n_at_risk", "n_excluded"] and b == 0:
+                    value_str = "-"
+                else:
+                    value = test_bucket_specific_metrics.get(key, 0 if metric_key.startswith('n_') else np.nan)
+                    if isinstance(value, (int, np.integer)):
+                        value_str = f"{value:d}"
+                    elif metric_key == "prevalence":
+                        value_str = f"{value:.2%}"
+                    else:
+                        value_str = format_str.format(value)
+                row += f" {value_str:<23} |"
+            logger.info(row)
         
         # Display bucket-specific metrics
         if test_bucket_metrics:
@@ -298,6 +382,10 @@ def main(args: DictConfig):
                           f"{metrics['prevalence']:>9.1f}% | {metrics['n_events']:>3}/{metrics['n_controls']:<3}")
         
         logger.info("\nTest evaluation completed.")
+        
+        # Export test predictions
+        logger.info("Exporting test predictions for subgroup analysis...")
+        multimodel.export_predictions(dataset_collection.test_f, 'test')
     else:
         logger.info("No test set available for evaluation.")
 

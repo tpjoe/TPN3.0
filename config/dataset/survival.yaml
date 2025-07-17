@@ -2,7 +2,7 @@
 dataset:
   # Central disease configuration - change this to switch diseases
   # Options: bpd, nec, rop, death, max_chole_TPNEHR (or their dated_ versions)
-  target_disease: bpd
+  target_disease: max_chole_TPNEHR
   _target_: src.data.survival.SurvivalDatasetCollection
   name: survival
   path: data/processed/autoregressive.csv  # Path to the CSV data file
@@ -78,10 +78,11 @@ dataset:
   # Define prediction horizons for sliding windows (only used when sliding_windows=true)
   # Format: [name, start_day, end_day] for bucket-based prediction
   horizons:
-    - ["immediate", 0, 1]      # Bucket 0: 0-1 days (immediate risk)
-    - ["eventual", 2, 50000]   # Bucket 1: 2-50000 days (long-term risk)
+    - ["1", 1, 2]      # Bucket 0: 0-1 days (immediate risk)
+    - ["2", 3, 20000]   # Bucket 1: 2-50000 days (long-term risk)
+    # - ["3", 367, 20000]   # Bucket 1: 2-50000 days (long-term risk)
   filter_bucket: null  # Filter to specific bucket name (e.g., "immediate", "eventual") or null for all buckets
-  # num_hazard_buckets: 3  # OPTIONAL - Automatically calculated as len(horizons) + 1
+  # num_hazard_buckets: 3  # OPTIONAL - Automatically calculated as len(horizons)
   sliding_windows: false  # Create sliding windows for survival analysis
   sequence_id_column: person_id  # Column identifying unique patients
   timestamp_column: DateOrdered  # Column containing time information

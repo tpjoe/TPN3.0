@@ -164,12 +164,6 @@ class CTSurvival(EDCTSurvival):
         
         treatment_pred = self.br_treatment_outcome_head.build_treatment(br, detach_treatment)
         
-        # Get raw hazard predictions (logits)
-        hazard_logits = self.br_treatment_outcome_head.build_outcome(br, curr_treatments)
-        
-        # Apply softplus to ensure non-negative hazards
-        hazard = F.softplus(hazard_logits)
-        
         # Get binary classification predictions for "ever disease"
         binary_pred = self.br_treatment_outcome_head.build_binary(br)
         
@@ -178,32 +172,15 @@ class CTSurvival(EDCTSurvival):
         # Apply softplus to get hazards (same as main hazard head)
         binary_treatment_hazard = F.softplus(binary_treatment_logits)
         
-        return treatment_pred, hazard, br, binary_pred, binary_treatment_hazard
+        return treatment_pred, br, binary_pred, binary_treatment_hazard
     
     def validation_step(self, batch, batch_idx):
         """Validation step for survival models"""
         from src.models.survival_losses import pc_hazard_loss
         
-        # Get predictions
-        treatment_pred, outcome_pred, _, binary_pred, binary_treatment_pred = self(batch)
-        
-        # Calculate PC-Hazard loss
-        outcome_loss = pc_hazard_loss(
-            outcome_pred, 
-            batch['event_time_bucket'],
-            batch['event_indicator'],
-            sequence_lengths=batch['sequence_lengths'],
-            last_timepoint_only=self.hparams.dataset.get('last_timepoint_only', True),
-            reduction='mean',
-            focal_gamma=self.hparams.dataset.get('focal_gamma', 0.0)
-        )
-        
-        # Log validation loss
-        self.log('val_loss', outcome_loss, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log('val_hazard_loss', outcome_loss, on_epoch=True, prog_bar=False, sync_dist=True)
-        
-        # Horizon-specific metrics will be calculated in on_validation_epoch_end
-        return
+        # The actual validation step is handled in the parent class (time_varying_model_survival.py)
+        # This method is just a placeholder to ensure proper inheritance
+        return super().validation_step(batch, batch_idx)
     
     def on_validation_epoch_end(self):
         """Calculate and display metrics for each horizon at end of validation epoch"""

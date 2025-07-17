@@ -97,7 +97,7 @@ def pc_hazard_loss(hazard_pred, event_time_bucket, event_indicator,
         raise NotImplementedError("seq2seq mode requires per-timestep event information")
     
     # Add zero padding at the beginning (for t=0 where hazard=0)
-    hazard_padded = pad_col(hazard_for_loss, where='start')
+    hazard_padded = pad_col(hazard_for_loss, where='end')
     
     # Calculate cumulative hazard up to event/censoring time
     cum_hazard = hazard_padded.cumsum(1)
@@ -108,7 +108,6 @@ def pc_hazard_loss(hazard_pred, event_time_bucket, event_indicator,
     sum_hazard = cum_hazard.gather(1, idx_durations).view(-1)
     
     # Get hazard at event time (from unpadded hazard)
-    # Clamp to ensure we don't go out of bounds
     idx_durations_clamped = torch.clamp(event_time_bucket, 0, n_buckets - 1)
     hazard_at_event = hazard_for_loss.gather(1, idx_durations_clamped.view(-1, 1)).view(-1)
     
@@ -149,3 +148,5 @@ def pc_hazard_loss(hazard_pred, event_time_bucket, event_indicator,
         return loss_per_patient.sum()
     else:
         raise ValueError(f"Invalid reduction: {reduction}")
+
+
