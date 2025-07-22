@@ -1205,8 +1205,8 @@ class BRCausalModel(TimeVaryingCausalModel):
         elif self.balancing == 'domain_confusion':
             bce_loss = self.bce_loss(treatment_pred, batch['current_treatments'].double(), kind='confuse')
         
-        # Calculate treatment correlations if testing
-        if self.trainer.testing:
+        # Calculate treatment correlations if testing or validating on test set
+        if self.trainer.testing or (self.trainer.validating and subset_name == 'test'):
             mask_treatments = batch['active_entries'].squeeze(-1).cpu().numpy().astype(bool)
             treatment_true = batch['current_treatments'].double().cpu().numpy()
             treatment_pred_np = treatment_pred.cpu().numpy()

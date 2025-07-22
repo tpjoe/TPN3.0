@@ -74,11 +74,14 @@ dataset:
   outcome_types:
   - binary  # Type of outcome: binary or continuous
   horizons:
-    - ["1", 1, 15]      # Bucket 0: 0-1 days (immediate risk)
-    - ["2", 16, 30]      # Bucket 0: 0-1 days (immediate risk)
-    - ["3", 31, 10000]      # Bucket 0: 0-1 days (immediate risk)
+    - ["1", 1, 7]      # Bucket 0: 0-1 days (immediate risk)
+    - ["2", 8, 15]      # Bucket 0: 0-1 days (immediate risk)
+    - ["3", 16, 30]      # Bucket 0: 0-1 days (immediate risk)
+    - ["4", 31, 60]      # Bucket 0: 0-1 days (immediate risk)
+    - ["5", 61, 90]      # Bucket 0: 0-1 days (immediate risk)
+    - ["6", 91, 120]      # Bucket 0: 0-1 days (immediate risk)
     # - ["4", 46, 60]      # Bucket 0: 0-1 days (immediate risk)
-  landmarks: [1, 2, 3, 5, 7, 10]  # Empty list disables landmark filtering
+  landmarks: [1, 3, 5, 7, 15, 30, 60, 180]  # Empty list disables landmark filtering
   sequence_id_column: person_id  # Column identifying unique patients
   timestamp_column: days_on_TPN  # Column containing time information
   scaling: standard  # Feature scaling method: standard or minmax

@@ -78,9 +78,14 @@ def main(args: DictConfig):
     multimodel_callbacks = [AlphaRise(rate=args.exp.alpha_rate), LossBreakdownCallback()]
     
     # Add model checkpoint callback to save best model
+    # Get disease name and run number for unique checkpoint directory
+    disease_name = dataset_collection.target_disease if hasattr(dataset_collection, 'target_disease') else 'default'
+    run_number = getattr(args.exp, 'run_number', 0)
+    checkpoint_dir = f'outputs/checkpoints/{disease_name}/run_{run_number}'
+    
     checkpoint_callback = ModelCheckpoint(
         monitor='val_loss',
-        dirpath='outputs/checkpoints',
+        dirpath=checkpoint_dir,
         filename='best-model-{epoch:02d}-{val_loss:.3f}',
         save_top_k=1,
         mode='min',
@@ -184,6 +189,17 @@ def main(args: DictConfig):
                 logger.info(f'Test {outcome_name} AUC-ROC Binary: {test_auc_roc}; AUC-PR Binary: {test_auc_pr}')
                 logger.info(f'Test {outcome_name} AUC-ROC Bucket: {test_auc_roc_bucket}; AUC-PR Bucket: {test_auc_pr_bucket}')
                 
+                # Extract and log treatment Pearson correlation if available
+                if test_results and len(test_results) > 0:
+                    # Get the first (and usually only) result dict
+                    test_metrics = test_results[0] if isinstance(test_results, list) else test_results
+                    
+                    # Look for treatment Pearson correlation in the metrics
+                    treatment_pearson_key = 'multi_test_treatment_pearson_r'
+                    if treatment_pearson_key in test_metrics:
+                        treatment_pearson_r = test_metrics[treatment_pearson_key]
+                        logger.info(f'Test Treatment Pearson R (averaged across all treatment components): {treatment_pearson_r:.4f}')
+                
                 # Get landmarks if available
                 landmarks = getattr(dataset_collection, 'landmarks', None)
                 
@@ -200,7 +216,7 @@ def main(args: DictConfig):
                         
                         # Get binary classification metrics for this landmark
                         binary_auc_roc, binary_auc_pr, binary_n_cases, binary_n_controls = multimodel.get_binary_classification_metrics(
-                            dataset_collection.test_f, landmark=landmark)
+                            dataset_collection.test_f)
                         
                         # Add binary metrics to CSV collection
                         if binary_n_cases + binary_n_controls > 0:
@@ -271,6 +287,7 @@ def main(args: DictConfig):
                     # Save landmark results to file for later analysis
                     import json
                     output_dir = Path(ROOT_PATH) / 'outputs'
+                    output_dir.mkdir(exist_ok=True)  # Ensure directory exists
                     with open(output_dir / f'landmark_results_{outcome_name}.json', 'w') as f:
                         # Convert numpy values to native Python types for JSON serialization
                         json_safe_results = {}
@@ -288,7 +305,16 @@ def main(args: DictConfig):
                     if all_metrics_rows:
                         import pandas as pd
                         df = pd.DataFrame(all_metrics_rows)
-                        csv_path = output_dir / 'results.csv'
+                        
+                        # Create disease-specific directory
+                        disease_output_dir = output_dir / outcome_name
+                        disease_output_dir.mkdir(exist_ok=True)
+                        
+                        # Get run number from args (default to 0 if not provided)
+                        run_number = getattr(args.exp, 'run_number', 0)
+                        csv_filename = f'results_{run_number}.csv'
+                        csv_path = disease_output_dir / csv_filename
+                        
                         df.to_csv(csv_path, index=False)
                         logger.info(f"Saved all metrics to {csv_path}")
                 else:

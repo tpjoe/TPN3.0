@@ -128,6 +128,8 @@ def load_synthetic_neonatal_data(data_path: str,
     # Convert landmark values to categorical indices (0, 1, 2, ...)
     unique_landmarks = sorted(df['landmark'].unique())
     landmark_to_idx = {lm: idx for idx, lm in enumerate(unique_landmarks)}
+    # Use copy() to avoid fragmentation warning
+    df = df.copy()
     df['landmark_cat'] = df['landmark'].map(landmark_to_idx)
     
     # Extract static features (one per patient)
