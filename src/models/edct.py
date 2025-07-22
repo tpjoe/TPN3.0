@@ -48,11 +48,12 @@ class EDCT(BRCausalModel):
         self.basic_block_cls = None
         self.save_hyperparameters(args)  # Will be logged to mlflow
 
-    def _init_specific(self, sub_args: DictConfig):
+    def _init_specific(self, sub_args: DictConfig, dataset_collection=None):
         """
         Initialization of specific sub-network (Encoder/decoder)
         Args:
             sub_args: sub-network hyperparameters
+            dataset_collection: Dataset collection for getting num_buckets
         """
         try:
             self.max_seq_length = sub_args.max_seq_length
@@ -119,9 +120,13 @@ class EDCT(BRCausalModel):
             else:
                 total_dim_outcome = self.dim_outcome
                 
+            # Get number of buckets from dataset if available
+            num_buckets = len(dataset_collection.horizons) if dataset_collection is not None and hasattr(dataset_collection, 'horizons') else None
+            
             self.br_treatment_outcome_head = BRTreatmentOutcomeHead(self.seq_hidden_units, self.br_size,
                                                                     self.fc_hidden_units, self.dim_treatments, total_dim_outcome,
-                                                                    self.alpha, self.update_alpha, self.balancing)
+                                                                    self.alpha, self.update_alpha, self.balancing,
+                                                                    num_buckets=num_buckets)
         except MissingMandatoryValue:
             logger.warning(f"{self.model_type} not fully initialised - some mandatory args are missing! "
                            f"(It's ok, if one will perform hyperparameters search afterward).")
@@ -218,7 +223,7 @@ class EDCT(BRCausalModel):
         # Forward pass
         subset = Subset(dataset, [index])
         subset.subset_name = dataset.subset_name
-        self.get_predictions(subset)
+        _, _ = self.get_predictions(subset)
 
         for k in fig_keys:
             figs_axes[k][0].suptitle(f'{k}: {dataset.subset_name} datasets, datapoint index: {index}', fontsize=14)
@@ -264,7 +269,7 @@ class EDCTEncoder(EDCT):
         logger.info(f'Input size of {self.model_type}: {self.input_size}')
 
         self.basic_block_cls = TransformerEncoderBlock
-        self._init_specific(args.model.encoder)
+        self._init_specific(args.model.encoder, dataset_collection)
         self.save_hyperparameters(args)
 
     def prepare_data(self) -> None:
@@ -287,18 +292,24 @@ class EDCTEncoder(EDCT):
         
         treatment_pred = self.br_treatment_outcome_head.build_treatment(br, detach_treatment)
         outcome_pred = self.br_treatment_outcome_head.build_outcome(br, curr_treatments)
+        bucket_pred = self.br_treatment_outcome_head.build_bucket(br, curr_treatments)
         
         # Split predictions if multiple outcomes
         if hasattr(self, 'dim_outcome_list') and self.dim_outcome_list is not None:
             outcome_pred_dict = {}
+            bucket_pred_dict = {}
             start_idx = 0
             for outcome_name, dim in zip(self.dataset_collection.outcome_columns, self.dim_outcome_list):
                 end_idx = start_idx + dim
                 outcome_pred_dict[outcome_name] = outcome_pred[..., start_idx:end_idx]
+                # Bucket predictions should not be split - they represent time buckets, not outcomes
+                # Each outcome gets the full bucket predictions
+                bucket_pred_dict[outcome_name] = bucket_pred
                 start_idx = end_idx
             outcome_pred = outcome_pred_dict
+            bucket_pred = bucket_pred_dict
 
-        return treatment_pred, outcome_pred, br
+        return treatment_pred, outcome_pred, br, bucket_pred
 
 
 class EDCTDecoder(EDCT):
@@ -321,7 +332,7 @@ class EDCTDecoder(EDCT):
 
         self.encoder = encoder
         args.model.decoder.seq_hidden_units = self.encoder.br_size if encoder is not None else encoder_r_size
-        self._init_specific(args.model.decoder)
+        self._init_specific(args.model.decoder, dataset_collection)
         self.save_hyperparameters(args)
 
     def prepare_data(self) -> None:
@@ -345,15 +356,21 @@ class EDCTDecoder(EDCT):
         
         treatment_pred = self.br_treatment_outcome_head.build_treatment(br, detach_treatment)
         outcome_pred = self.br_treatment_outcome_head.build_outcome(br, curr_treatments)
+        bucket_pred = self.br_treatment_outcome_head.build_bucket(br, curr_treatments)
         
         # Split predictions if multiple outcomes
         if hasattr(self, 'dim_outcome_list') and self.dim_outcome_list is not None:
             outcome_pred_dict = {}
+            bucket_pred_dict = {}
             start_idx = 0
             for outcome_name, dim in zip(self.dataset_collection.outcome_columns, self.dim_outcome_list):
                 end_idx = start_idx + dim
                 outcome_pred_dict[outcome_name] = outcome_pred[..., start_idx:end_idx]
+                # Bucket predictions should not be split - they represent time buckets, not outcomes
+                # Each outcome gets the full bucket predictions
+                bucket_pred_dict[outcome_name] = bucket_pred
                 start_idx = end_idx
             outcome_pred = outcome_pred_dict
+            bucket_pred = bucket_pred_dict
 
-        return treatment_pred, outcome_pred, br
+        return treatment_pred, outcome_pred, br, bucket_pred

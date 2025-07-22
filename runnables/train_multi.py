@@ -9,7 +9,8 @@ from pytorch_lightning import Trainer
 from pytorch_lightning.utilities.seed import seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, EarlyStopping, ModelCheckpoint
 
-from src.models.utils import AlphaRise, FilteringMlFlowLogger
+from src import ROOT_PATH
+from src.models.utils import AlphaRise, FilteringMlFlowLogger, load_checkpoint_with_ema
 from src.models.time_varying_model import LossBreakdownCallback, GradNormCallback
 
 logging.basicConfig(level=logging.INFO)
@@ -19,9 +20,10 @@ torch.set_default_dtype(torch.double)
 # Set specific loggers to higher level to reduce output
 logging.getLogger('src.data').setLevel(logging.WARNING)
 logging.getLogger('src.models').setLevel(logging.WARNING)
+logging.getLogger('pytorch_lightning').setLevel(logging.ERROR)
 
 
-@hydra.main(config_name=f'config.yaml', config_path='../config/')
+@hydra.main(version_base="1.1", config_name=f'config.yaml', config_path='../config/')
 def main(args: DictConfig):
     """
     Training / evaluation script for CT (Causal Transformer)
@@ -113,6 +115,9 @@ def main(args: DictConfig):
 
     # ============================== Initialisation & Training of multimodel ==============================
     multimodel = instantiate(args.model.multi, args, dataset_collection, _recursive_=False)
+    # Debug: Model correctly has 2 buckets
+    # print(multimodel.br_treatment_outcome_head.num_buckets)  # outputs: 2
+    # print(multimodel.br_treatment_outcome_head.linear7.out_features)  # outputs: 2
     if args.model.multi.tune_hparams:
         multimodel.finetune(resources_per_trial=args.model.multi.resources_per_trial)
 
@@ -130,54 +135,28 @@ def main(args: DictConfig):
     
     # Check if we have a best model from checkpoint
     if checkpoint_callback.best_model_path:
-        # Load best model weights
-        checkpoint = torch.load(checkpoint_callback.best_model_path, weights_only=False)
-        # PyTorch Lightning checkpoint contains state_dict as a key
-        if 'state_dict' in checkpoint:
-            multimodel.load_state_dict(checkpoint['state_dict'])
-        else:
-            multimodel.load_state_dict(checkpoint)
+        # Load best model weights with EMA if available
+        checkpoint = load_checkpoint_with_ema(multimodel, checkpoint_callback.best_model_path, use_ema=True)
         logger.info(f"Loaded best model from epoch with val_loss={checkpoint_callback.best_model_score:.4f}")
     
     torch.save(multimodel.state_dict(), output_dir / 'trained_model.pt')
     logger.info(f"Saved trained model to {output_dir / 'trained_model.pt'}")
 
     # Validation factual evaluation
-    val_dataloader = DataLoader(dataset_collection.val_f, batch_size=args.dataset.val_batch_size, shuffle=False)
+    val_dataloader = DataLoader(dataset_collection.val_f, batch_size=args.dataset.val_batch_size, shuffle=False, num_workers=4)
     val_test_results = multimodel_trainer.validate(multimodel, dataloaders=val_dataloader, ckpt_path='last')
     # multimodel.visualize(dataset_collection.val_f, index=0, artifacts_path=artifacts_path)
     
     # Calculate metrics based on outcome types
     val_metrics = {}
-    
-    if hasattr(dataset_collection, 'outcome_types'):
-        # Multiple outcomes - calculate metrics for each
-        for i, (outcome_name, otype) in enumerate(zip(dataset_collection.outcome_columns, dataset_collection.outcome_types)):
-            if otype == 'binary':
-                # Extract predictions for this specific outcome
-                val_auc_roc, val_auc_pr = multimodel.get_binary_classification_metrics(
-                    dataset_collection.val_f, outcome_idx=i)
-                logger.info(f'Val {outcome_name} AUC-ROC: {val_auc_roc}; AUC-PR: {val_auc_pr}')
-                val_metrics[f'val_{outcome_name}_auc_roc'] = val_auc_roc
-                val_metrics[f'val_{outcome_name}_auc_pr'] = val_auc_pr
-            else:
-                # Get RMSE for continuous outcome
-                val_rmse_orig, val_rmse_all = multimodel.get_normalised_masked_rmse(
-                    dataset_collection.val_f, outcome_idx=i)
-                logger.info(f'Val {outcome_name} normalised RMSE (all): {val_rmse_all}; (orig): {val_rmse_orig}')
-                val_metrics[f'val_{outcome_name}_rmse_all'] = val_rmse_all
-                val_metrics[f'val_{outcome_name}_rmse_orig'] = val_rmse_orig
-    else:
-        # Single outcome - original behavior
-        if hasattr(dataset_collection, 'outcome_type') and dataset_collection.outcome_type == 'binary':
-            val_auc_roc, val_auc_pr = multimodel.get_binary_classification_metrics(dataset_collection.val_f)
-            logger.info(f'Val AUC-ROC: {val_auc_roc}; Val AUC-PR: {val_auc_pr}')
-            val_rmse_orig, val_rmse_all = None, None
-        else:
-            val_rmse_orig, val_rmse_all = multimodel.get_normalised_masked_rmse(dataset_collection.val_f)
-            logger.info(f'Val normalised RMSE (all): {val_rmse_all}; Val normalised RMSE (orig): {val_rmse_orig}')
-            val_auc_roc, val_auc_pr = None, None
 
+    # Single outcome - original behavior
+    val_auc_roc, val_auc_pr, _, _ = multimodel.get_binary_classification_metrics(dataset_collection.val_f)
+    val_auc_roc_bucket, val_auc_pr_bucket = multimodel.get_bucket_classification_metrics(dataset_collection.val_f)
+    logger.info(f'Val AUC-ROC Binary: {val_auc_roc}; Val AUC-PR Binary: {val_auc_pr}')
+    # logger.info(f'Val AUC-ROC Bucket: {val_auc_roc_bucket}; Val AUC-PR Bucket: {val_auc_pr_bucket}')
+    val_rmse_orig, val_rmse_all = None, None
+    
     encoder_results = {}
     if hasattr(dataset_collection, 'outcome_types'):
         # Multiple outcomes - add all val metrics with encoder prefix
@@ -186,68 +165,181 @@ def main(args: DictConfig):
         
         # Test set evaluation for multiple outcomes
         if hasattr(dataset_collection, 'test_f'):
-            # Run trainer.test on test set
-            test_dataloader = DataLoader(dataset_collection.test_f, batch_size=args.dataset.val_batch_size, shuffle=False)
-            test_results = multimodel_trainer.test(multimodel, test_dataloaders=test_dataloader)
+            # Run trainer.validate on test set
+            test_dataloader = DataLoader(dataset_collection.test_f, batch_size=args.dataset.val_batch_size, shuffle=False, num_workers=4)
+            test_results = multimodel_trainer.validate(multimodel, dataloaders=test_dataloader)
             
             # Calculate metrics for each outcome
             for i, (outcome_name, otype) in enumerate(zip(dataset_collection.outcome_columns, dataset_collection.outcome_types)):
-                if otype == 'binary':
-                    test_auc_roc, test_auc_pr = multimodel.get_binary_classification_metrics(
-                        dataset_collection.test_f, outcome_idx=i)
+                test_auc_roc, test_auc_pr, n_cases, n_controls = multimodel.get_binary_classification_metrics(dataset_collection.test_f)
+                test_auc_roc_bucket, test_auc_pr_bucket = multimodel.get_bucket_classification_metrics(dataset_collection.test_f)
+                
+                # Get the ground truth used for AUC calculation
+                test_data = dataset_collection.test_f.data
+                seq_lengths = test_data['sequence_lengths'] if isinstance(test_data['sequence_lengths'], np.ndarray) else test_data['sequence_lengths'].numpy()
+                
+                # Use the counts from get_binary_classification_metrics which includes landmark filtering
+                logger.info(f'Test {outcome_name}: {n_cases} cases, {n_controls} controls (from {n_cases + n_controls} patients)')
+                logger.info(f'Minimum sequence length in test data: {seq_lengths.min()}')
+                logger.info(f'Test {outcome_name} AUC-ROC Binary: {test_auc_roc}; AUC-PR Binary: {test_auc_pr}')
+                logger.info(f'Test {outcome_name} AUC-ROC Bucket: {test_auc_roc_bucket}; AUC-PR Bucket: {test_auc_pr_bucket}')
+                
+                # Get landmarks if available
+                landmarks = getattr(dataset_collection, 'landmarks', None)
+                
+                if landmarks:
+                    # Store all landmark results
+                    landmark_results = {}
                     
-                    # Get the ground truth used for AUC calculation
-                    test_data = dataset_collection.test_f.data
-                    seq_lengths = test_data['sequence_lengths'] if isinstance(test_data['sequence_lengths'], np.ndarray) else test_data['sequence_lengths'].numpy()
-                    active_entries = test_data['active_entries'] if isinstance(test_data['active_entries'], np.ndarray) else test_data['active_entries'].numpy()
-                    outcomes = test_data['outputs'][:, :, i] if isinstance(test_data['outputs'], np.ndarray) else test_data['outputs'][:, :, i].numpy()
+                    # Collect all metrics for CSV
+                    all_metrics_rows = []
                     
-                    # Get last active outcome for each patient (same logic as in get_binary_classification_metrics)
-                    y_true_last = []
-                    positive_patients = []
-                    for j in range(len(seq_lengths)):
-                        active_mask = active_entries[j, :, 0].astype(bool)
-                        if active_mask.any():
-                            last_active_idx = np.where(active_mask)[0][-1]
-                            outcome_val = outcomes[j, last_active_idx]
-                            y_true_last.append(outcome_val)
-                            if outcome_val == 1:
-                                positive_patients.append((j, last_active_idx, seq_lengths[j]))
+                    # Print per-landmark tables (including full sequence)
+                    for landmark in landmarks + [max(landmarks) + 1]:
+                        landmark_label = "Full Sequence" if landmark == max(landmarks) + 1 else f"Landmark {landmark}"
+                        
+                        # Get binary classification metrics for this landmark
+                        binary_auc_roc, binary_auc_pr, binary_n_cases, binary_n_controls = multimodel.get_binary_classification_metrics(
+                            dataset_collection.test_f, landmark=landmark)
+                        
+                        # Add binary metrics to CSV collection
+                        if binary_n_cases + binary_n_controls > 0:
+                            binary_prevalence = binary_n_cases / (binary_n_cases + binary_n_controls)
+                            all_metrics_rows.append({
+                                'outcome': outcome_name,
+                                'landmark': landmark_label,
+                                'bucket': 'binary',
+                                'horizon': 'overall',
+                                'n_cases': binary_n_cases,
+                                'n_controls': binary_n_controls,
+                                'prevalence': binary_prevalence,
+                                'auc_roc': binary_auc_roc,
+                                'auc_pr': binary_auc_pr
+                            })
+                        
+                        # Get per-bucket metrics for this landmark
+                        per_bucket_results = multimodel.get_bucket_classification_metrics(
+                            dataset_collection.test_f, per_bucket=True, landmark=landmark)
+                        test_auc_roc_per_bucket, test_auc_pr_per_bucket, n_cases_per_bucket, n_controls_per_bucket = per_bucket_results
+                        
+                        # Store results
+                        landmark_results[landmark] = {
+                            'auc_roc': test_auc_roc_per_bucket,
+                            'auc_pr': test_auc_pr_per_bucket,
+                            'n_cases': n_cases_per_bucket,
+                            'n_controls': n_controls_per_bucket
+                        }
+                        
+                        if test_auc_roc_per_bucket and test_auc_pr_per_bucket:
+                            logger.info(f"\n{landmark_label}")
+                            logger.info("-" * 110)
+                            logger.info(f"{'Bucket':<10} {'Horizon':<25} {'Cases':<10} {'Controls':<10} {'Prevalence':<12} {'AUC-ROC':<10} {'AUC-PR':<10}")
+                            logger.info("-" * 110)
+                            
+                            # Get horizon definitions if available
+                            horizons = getattr(dataset_collection, 'horizons', None)
+                            
+                            for b in range(len(test_auc_roc_per_bucket)):
+                                horizon_str = ""
+                                if horizons and b < len(horizons):
+                                    _, min_days, max_days = horizons[b]
+                                    horizon_str = f"[{min_days}, {max_days}] days"
+                                
+                                n_cases = n_cases_per_bucket[b]
+                                n_controls = n_controls_per_bucket[b]
+                                prevalence = n_cases / (n_cases + n_controls) if (n_cases + n_controls) > 0 else 0
+                                auc_roc_b = test_auc_roc_per_bucket[b]
+                                auc_pr_b = test_auc_pr_per_bucket[b]
+                                
+                                logger.info(f"{b:<10} {horizon_str:<25} {n_cases:<10} {n_controls:<10} {prevalence:<12.3f} {auc_roc_b:<10.4f} {auc_pr_b:<10.4f}")
+                                
+                                # Collect row for CSV
+                                all_metrics_rows.append({
+                                    'outcome': outcome_name,
+                                    'landmark': landmark_label,
+                                    'bucket': b,
+                                    'horizon': horizon_str,
+                                    'n_cases': n_cases,
+                                    'n_controls': n_controls,
+                                    'prevalence': prevalence,
+                                    'auc_roc': auc_roc_b,
+                                    'auc_pr': auc_pr_b
+                                })
+                            
+                            logger.info("-" * 110)
                     
+                    # Save landmark results to file for later analysis
+                    import json
+                    output_dir = Path(ROOT_PATH) / 'outputs'
+                    with open(output_dir / f'landmark_results_{outcome_name}.json', 'w') as f:
+                        # Convert numpy values to native Python types for JSON serialization
+                        json_safe_results = {}
+                        for lm, results in landmark_results.items():
+                            json_safe_results[str(lm)] = {
+                                'auc_roc': [float(x) if not np.isnan(x) else None for x in results['auc_roc']],
+                                'auc_pr': [float(x) if not np.isnan(x) else None for x in results['auc_pr']],
+                                'n_cases': [int(x) for x in results['n_cases']],
+                                'n_controls': [int(x) for x in results['n_controls']]
+                            }
+                        json.dump(json_safe_results, f, indent=2)
+                    logger.info(f"Saved landmark results to {output_dir / f'landmark_results_{outcome_name}.json'}")
                     
-                    
-                    # One-liner for case/control breakdown
-                    logger.info(f'Test {outcome_name}: {sum(y_true_last)} cases, {len(y_true_last) - sum(y_true_last)} controls (from {len(y_true_last)} patients)')
-                    logger.info(f'Minimum sequence length in test data: {seq_lengths.min()}')
-                    logger.info(f'Test {outcome_name} AUC-ROC: {test_auc_roc}; AUC-PR: {test_auc_pr}')
-                    
-                    # Load patient splits to get actual person IDs
-                    import pickle
-                    from pathlib import Path
-                    from src import ROOT_PATH
-                    # Use ROOT_PATH to ensure we find the file regardless of working directory
-                    splits_path = Path(ROOT_PATH) / 'outputs' / 'patient_splits.pkl'
-                    if splits_path.exists():
-                        with open(splits_path, 'rb') as f:
-                            patient_splits = pickle.load(f)
-                        test_person_ids = patient_splits['test']
-                    else:
-                        logger.warning(f"Could not find patient splits file at {splits_path}")
-                        test_person_ids = list(range(len(y_true_last)))  # Use indices as fallback
-                    
-                    
-                    encoder_results.update({
-                        f'encoder_test_{outcome_name}_auc_roc': test_auc_roc,
-                        f'encoder_test_{outcome_name}_auc_pr': test_auc_pr
-                    })
+                    # Save all collected metrics to CSV
+                    if all_metrics_rows:
+                        import pandas as pd
+                        df = pd.DataFrame(all_metrics_rows)
+                        csv_path = output_dir / 'results.csv'
+                        df.to_csv(csv_path, index=False)
+                        logger.info(f"Saved all metrics to {csv_path}")
                 else:
-                    test_rmse_orig, test_rmse_all = multimodel.get_normalised_masked_rmse(
-                        dataset_collection.test_f, outcome_idx=i)
-                    logger.info(f'Test {outcome_name} normalised RMSE (all): {test_rmse_all}; (orig): {test_rmse_orig}')
-                    encoder_results.update({
-                        f'encoder_test_{outcome_name}_rmse_all': test_rmse_all,
-                        f'encoder_test_{outcome_name}_rmse_orig': test_rmse_orig
-                    })
+                    # No landmarks - get overall metrics
+                    per_bucket_results = multimodel.get_bucket_classification_metrics(
+                        dataset_collection.test_f, per_bucket=True)
+                    test_auc_roc_per_bucket, test_auc_pr_per_bucket, n_cases_per_bucket, n_controls_per_bucket = per_bucket_results
+                    
+                    if test_auc_roc_per_bucket and test_auc_pr_per_bucket:
+                        logger.info(f"\nPer-Bucket Metrics for {outcome_name}:")
+                        logger.info("-" * 110)
+                        logger.info(f"{'Bucket':<10} {'Horizon':<25} {'Cases':<10} {'Controls':<10} {'Prevalence':<12} {'AUC-ROC':<10} {'AUC-PR':<10}")
+                        logger.info("-" * 110)
+                        
+                        # Get horizon definitions if available
+                        horizons = getattr(dataset_collection, 'horizons', None)
+                        
+                        for b in range(len(test_auc_roc_per_bucket)):
+                            horizon_str = ""
+                            if horizons and b < len(horizons):
+                                _, min_days, max_days = horizons[b]
+                                horizon_str = f"[{min_days}, {max_days}] days"
+                            
+                            n_cases = n_cases_per_bucket[b]
+                            n_controls = n_controls_per_bucket[b]
+                            prevalence = n_cases / (n_cases + n_controls) if (n_cases + n_controls) > 0 else 0
+                            auc_roc_b = test_auc_roc_per_bucket[b]
+                            auc_pr_b = test_auc_pr_per_bucket[b]
+                            
+                            logger.info(f"{b:<10} {horizon_str:<25} {n_cases:<10} {n_controls:<10} {prevalence:<12.3f} {auc_roc_b:<10.4f} {auc_pr_b:<10.4f}")
+                        
+                        logger.info("-" * 110 + "\n")
+                
+                # Load patient splits to get actual person IDs
+                import pickle
+                from pathlib import Path
+                # Use ROOT_PATH to ensure we find the file regardless of working directory
+                splits_path = Path(ROOT_PATH) / 'outputs' / 'patient_splits.pkl'
+                if splits_path.exists():
+                    with open(splits_path, 'rb') as f:
+                        patient_splits = pickle.load(f)
+                    test_person_ids = patient_splits['test']
+                else:
+                    logger.warning(f"Could not find patient splits file at {splits_path}")
+                    test_person_ids = list(range(len(y_true_last)))  # Use indices as fallback
+                
+                
+                encoder_results.update({
+                    f'encoder_test_{outcome_name}_auc_roc': test_auc_roc,
+                    f'encoder_test_{outcome_name}_auc_pr': test_auc_pr
+                })
     else:
         # Continuous outcomes - use RMSE
         if hasattr(dataset_collection, 'test_cf_one_step'):  # Test one_step_counterfactual rmse

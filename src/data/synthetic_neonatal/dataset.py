@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import logging
+from dateutil.parser import parse
 from sklearn.model_selection import train_test_split
 
 from src import ROOT_PATH
@@ -16,16 +17,17 @@ def load_synthetic_neonatal_data(data_path: str,
                                  outcome_columns: list,
                                  outcome_types: list,
                                  timestamp_column: str,
+                                 horizons: list,
+                                 landmarks: list,
                                  min_seq_length: int = None,
                                  max_seq_length: int = None,
                                  max_number: int = None,
                                  data_seed: int = 100,
-                                 right_censor: bool = False,
                                  **kwargs):
     """
     Load and pre-process synthetic neonatal CSV data to match MIMIC-III format
     
-    Returns: treatments, outcomes, vitals, static_features, outcomes_unscaled, scaling_params
+    Returns: treatments, outcomes, vitals, static_features, scaling_params
     """
     logger.info(f"Loading CSV data from {data_path}")
     # Use low_memory=False to avoid DtypeWarning about mixed types
@@ -35,98 +37,84 @@ def load_synthetic_neonatal_data(data_path: str,
     # First sort by person_id and timestamp to ensure proper time ordering
     df = df.sort_values(['person_id', timestamp_column])
     
-    # Shift outcomes by 1 position earlier if requested (for 1-day-ahead prediction)
-    outcome_shift = kwargs.get('outcome_shift', 0)
-    if outcome_shift > 0:
-        logger.info(f"Shifting outcomes {outcome_shift} position(s) earlier for each patient")
-        shifted_dfs = []
-        for person_id, person_df in df.groupby('person_id'):
-            person_df = person_df.copy()
-            # Shift outcome columns up by outcome_shift positions
-            for col in outcome_columns:
-                if col in person_df.columns:
-                    person_df[col] = person_df[col].shift(-outcome_shift)
-            # Drop last outcome_shift rows (which now have NaN outcomes)
-            person_df = person_df.iloc[:-outcome_shift]
-            if len(person_df) > 0:  # Only keep if there are remaining rows
-                shifted_dfs.append(person_df)
-        
-        df = pd.concat(shifted_dfs, ignore_index=True)
-        logger.info(f"After outcome shifting: {len(df)} timesteps from {df['person_id'].nunique()} patients")
-    
     # Apply right censoring if requested
-    if right_censor:
-        # Find binary outcome columns
-        binary_dated_outcomes = []
-        for i, (col, otype) in enumerate(zip(outcome_columns, outcome_types)):
-            if otype == 'binary':
-                binary_dated_outcomes.append(col)
+    disease_column = outcome_columns[0]
+    disease_date_col = f'{disease_column}_date'
+    
+    # Convert date columns to datetime
+    def parse_date_or_nat(s):
+        try:
+            return pd.to_datetime(parse(str(s)))
+        except Exception:
+            return pd.NaT
+    
+    df['DateOrdered'] = df['DateOrdered'].apply(parse_date_or_nat)
+    df[disease_date_col] = df[disease_date_col].apply(parse_date_or_nat)
+    
+    # Apply censoring: keep only records where DateOrdered <= disease_date (or disease==0)
+    _, abs_min_days, _ = horizons[0]
+    df = df.loc[(pd.to_datetime(df['DateOrdered']) <= (pd.to_datetime(df[disease_date_col]) - pd.to_timedelta(abs_min_days, unit='d'))) | 
+                (df[disease_column] == 0), :]
+    
+    # Special handling for max_chole_TPNEHR
+    if 'max_chole_TPNEHR' in disease_column:
+        unique_patients = df.drop_duplicates('person_id')
+        required_date_cols = ['chole_EHR_date', 'max_chole_TPN_date']
+        missing_cols = [col for col in required_date_cols if col not in df.columns]
+        exclude_mask = (unique_patients['max_chole_TPNEHR'] == 1) & \
+                        (unique_patients[required_date_cols].isna().all(axis=1))
+        exclude_person_ids = unique_patients.loc[exclude_mask, 'person_id']
         
-        if binary_dated_outcomes:
-            # Use the first binary outcome for censoring (typically there's only one)
-            outcome_column = binary_dated_outcomes[0]
-            # Remove 'dated_' prefix if it exists, otherwise use as is
-            disease_column = outcome_column.replace('dated_', '') if outcome_column.startswith('dated_') else outcome_column
-            disease_date_col = f'{disease_column}_date'
-            
-            # Check required columns exist
-            if 'DateOrdered' not in df.columns:
-                raise ValueError(f"DateOrdered column not found in data. Available columns: {df.columns.tolist()}")
-            
-            if disease_date_col not in df.columns:
-                raise ValueError(f"{disease_date_col} column not found in data. Available columns: {df.columns.tolist()}")
-            
-            if disease_column not in df.columns:
-                raise ValueError(f"{disease_column} column not found in data. Available columns: {df.columns.tolist()}")
-            
-            logger.info(f"Applying right censoring using DateOrdered <= {disease_date_col}")
-            
-            
-            # Convert date columns to datetime
-            df['DateOrdered'] = pd.to_datetime(df['DateOrdered'], errors='coerce')
-            df[disease_date_col] = pd.to_datetime(df[disease_date_col], errors='coerce')
-            
-            # Apply censoring: keep only records where DateOrdered <= disease_date (or disease==0)
-            df = df.loc[(pd.to_datetime(df['DateOrdered']) <= pd.to_datetime(df[disease_date_col])) | 
-                       (df[disease_column] == 0), :]
-            logger.info(f"After DateOrdered censoring: {len(df)} timesteps from {df['person_id'].nunique()} patients")
-            
-            
-            # Special handling for max_chole_TPNEHR
-            if 'max_chole_TPNEHR' in disease_column:
-                logger.info("Applying special exclusion for max_chole_TPNEHR cases")
-                
-                # Get unique patients
-                unique_patients = df.drop_duplicates('person_id')
-                
-                # Check for both possible date columns
-                required_date_cols = ['chole_EHR_date', 'max_chole_TPN_date']
-                missing_cols = [col for col in required_date_cols if col not in df.columns]
-                if missing_cols:
-                    raise ValueError(f"Required date columns {missing_cols} not found for max_chole_TPNEHR exclusion. Available columns: {df.columns.tolist()}")
-                
-                if 'max_chole_TPNEHR' not in df.columns:
-                    raise ValueError(f"max_chole_TPNEHR column required but not found. Available columns: {df.columns.tolist()}")
-                
-                # Find patients with max_chole_TPNEHR==1 but all date columns are NaN
-                exclude_mask = (unique_patients['max_chole_TPNEHR'] == 1) & \
-                             (unique_patients[required_date_cols].isna().all(axis=1))
-                exclude_person_ids = unique_patients.loc[exclude_mask, 'person_id']
-                
-                # Exclude these patients
-                df = df.loc[~df['person_id'].isin(exclude_person_ids.values), :]
-                logger.info(f"Excluded {len(exclude_person_ids)} patients with max_chole_TPNEHR==1 but no dates")
-                logger.info(f"After exclusion: {len(df)} timesteps from {df['person_id'].nunique()} patients")
+        # Exclude these patients
+        df = df.loc[~df['person_id'].isin(exclude_person_ids.values), :]
     
-    # Create timestep column for each patient
-    # Group by person_id and create sequential timesteps
-    # Use copy() to avoid PerformanceWarning about DataFrame fragmentation
+    # IMPORTANT: Calculate outcomes_bucket BEFORE landmark filtering
+    # This ensures we capture the true event time even if we truncate data later
+    days_to_disease_full = (df[disease_date_col] - df['DateOrdered']).dt.days
+    df["outcomes_bucket"] = len(horizons)  # Default to censored
+    
+    for bucket_idx, (_, min_days, max_days) in enumerate(horizons):
+        mask = (days_to_disease_full >= min_days) & (days_to_disease_full <= max_days)
+        df.loc[mask, "outcomes_bucket"] = bucket_idx
+
+    # sliding windows and screen by landmarks
+    if landmarks:  # If landmarks are specified
+        # For each patient, only include them in landmarks they've reached
+        dfs_by_landmark = []
+        
+        # Group by person_id to process each patient
+        for person_id, patient_df in df.groupby('person_id'):
+            max_day = patient_df['day_since_birth'].max()
+            
+            # For each landmark this patient has reached
+            for lm in landmarks:
+                if max_day >= lm:
+                    # Include data up to landmark day
+                    patient_lm_df = patient_df.loc[patient_df.day_since_birth <= lm].copy()
+                    patient_lm_df['landmark'] = lm
+                    dfs_by_landmark.append(patient_lm_df)
+            
+            # Add the full sequence only if it's different from existing landmarks
+            if max_day not in landmarks:
+                patient_full_df = patient_df.copy()
+                patient_full_df['landmark'] = max(landmarks) + 1  # Use a value that won't conflict
+                dfs_by_landmark.append(patient_full_df)
+        
+        df = pd.concat(dfs_by_landmark, ignore_index=True)
+    else:  # No landmarks - just use full sequences
+        df['landmark'] = 0  # Single landmark value for all patients
+
+    # Create timestep column for each patient-landmark combination
     df = df.copy()
-    df['timestep'] = df.groupby('person_id').cumcount()
     
-    # Set multi-index (person_id as subject_id, timestep)
-    df = df.set_index(['person_id', 'timestep'])
-    df.index.names = ['subject_id', 'timestep']  # Rename to match MIMIC-III convention
+    # Create unique subject_id that combines person_id and landmark
+    df['subject_id'] = df['person_id'].astype(str) + '_L' + df['landmark'].astype(str)
+    
+    # Now create timestep based on this new subject_id
+    df['timestep'] = df.groupby('subject_id').cumcount()
+
+    # Set multi-index using the new subject_id
+    df = df.set_index(['subject_id', 'timestep'])
     
     # Sort index to ensure proper ordering
     df = df.sort_index()
@@ -136,33 +124,34 @@ def load_synthetic_neonatal_data(data_path: str,
     vitals = df[vital_columns] if vital_columns else pd.DataFrame()
     outcomes = df[outcome_columns]
     
+    # Add landmark as a categorical static feature
+    # Convert landmark values to categorical indices (0, 1, 2, ...)
+    unique_landmarks = sorted(df['landmark'].unique())
+    landmark_to_idx = {lm: idx for idx, lm in enumerate(unique_landmarks)}
+    df['landmark_cat'] = df['landmark'].map(landmark_to_idx)
+    
     # Extract static features (one per patient)
-    # Get unique values per patient from the first timestep
-    static_features = df[static_columns].groupby('subject_id').first()
+    static_columns_with_landmark = static_columns + ['landmark_cat']
+    static_features = df[static_columns_with_landmark].groupby('subject_id').first()
     
     # Filter by sequence length
     user_sizes = df.groupby('subject_id').size()
-    
-    
     filtered_users = user_sizes.index[user_sizes >= min_seq_length] if min_seq_length is not None else user_sizes.index
-    
-    if max_number is not None:
-        np.random.seed(data_seed)
-        filtered_users = np.random.choice(filtered_users, size=min(max_number, len(filtered_users)), replace=False)
     
     # Apply filtering
     treatments = treatments.loc[filtered_users]
     outcomes = outcomes.loc[filtered_users]
     vitals = vitals.loc[filtered_users] if not vitals.empty else vitals
+    filtered_df = df.loc[filtered_users].copy()
     
     # Crop to max sequence length (take last N timesteps)
     if max_seq_length is not None:
         treatments = treatments.groupby('subject_id').tail(max_seq_length)
         outcomes = outcomes.groupby('subject_id').tail(max_seq_length)
         vitals = vitals.groupby('subject_id').tail(max_seq_length) if not vitals.empty else vitals
+        filtered_df = filtered_df.groupby('subject_id').tail(max_seq_length)
         
         # Reset timestep indices to start from 0 for each patient after tail()
-        # This ensures proper alignment for the reshape operation
         def reset_timesteps(df):
             df = df.reset_index(level=1, drop=True)
             df.index = pd.MultiIndex.from_arrays([
@@ -174,16 +163,13 @@ def load_synthetic_neonatal_data(data_path: str,
         treatments = reset_timesteps(treatments)
         outcomes = reset_timesteps(outcomes)
         vitals = reset_timesteps(vitals) if not vitals.empty else vitals
+        filtered_df = reset_timesteps(filtered_df)
     
     static_features = static_features[static_features.index.isin(filtered_users)]
     
     logger.info(f'Number of patients filtered: {len(filtered_users)}.')
-    
-    # Store unscaled outcomes
-    outcomes_unscaled = outcomes.copy()
-    
+        
     # Global scaling (same as MIMIC-III)
-    # Scale vitals first
     if not vitals.empty:
         mean_vitals = np.mean(vitals, axis=0)
         std_vitals = np.std(vitals, axis=0)
@@ -192,33 +178,6 @@ def load_synthetic_neonatal_data(data_path: str,
         vitals = (vitals - mean_vitals) / std_vitals
         # Handle NaN values from zero std
         vitals = vitals.fillna(0.0)
-    
-    # Scale outcomes based on their types
-    mean_outcomes = {}
-    std_outcomes = {}
-    scaled_outcomes = []
-    
-    for col, otype in zip(outcome_columns, outcome_types):
-        if otype == 'binary':
-            # Keep binary outcomes as is (0 or 1)
-            scaled_outcomes.append(outcomes[col])
-            mean_outcomes[col] = 0.0  # Dummy values for compatibility
-            std_outcomes[col] = 1.0
-        else:
-            # Scale continuous outcomes
-            col_mean = np.mean(outcomes[col])
-            col_std = np.std(outcomes[col])
-            # Replace zero std with 1 to avoid division by zero
-            if col_std == 0:
-                col_std = 1.0
-            scaled_col = (outcomes[col] - col_mean) / col_std
-            scaled_col = scaled_col.fillna(0.0)
-            scaled_outcomes.append(scaled_col)
-            mean_outcomes[col] = col_mean
-            std_outcomes[col] = col_std
-    
-    # Reconstruct outcomes DataFrame with scaled values
-    outcomes = pd.concat(scaled_outcomes, axis=1)
     
     # Scale treatments separately
     treatments_mean = np.mean(treatments, axis=0)
@@ -229,37 +188,41 @@ def load_synthetic_neonatal_data(data_path: str,
     # Handle NaN values from zero std
     treatments = treatments.fillna(0.0)
     
-    # Process static features (standardize continuous, keep categorical as is)
-    # First, get the mean and std for static features before scaling
-    static_features_numeric = static_features.select_dtypes(include=[np.number])
-    static_mean = np.mean(static_features_numeric.values, axis=0)
-    static_std = np.std(static_features_numeric.values, axis=0)
-    # Replace zero std with 1 to avoid division by zero
-    static_std[static_std == 0] = 1.0
+    # Process static features - only scale gest_age and bw
+    continuous_cols = ['gest_age', 'bw']
+    
+    # Calculate mean and std only for continuous columns
+    static_mean = []
+    static_std = []
+    for col in static_features.columns:
+        if col in continuous_cols:
+            static_mean.append(np.mean(static_features[col]))
+            std_val = np.std(static_features[col])
+            static_std.append(std_val if std_val != 0 else 1.0)
+        else:
+            static_mean.append(0.0)  # Placeholder for categorical
+            static_std.append(1.0)   # Placeholder for categorical
+    
+    static_mean = np.array(static_mean)
+    static_std = np.array(static_std)
     
     processed_static = []
     for col in static_features.columns:
         col_data = static_features[col]
-        # Assume numeric columns are continuous
-        if pd.api.types.is_numeric_dtype(col_data):
+        if col in continuous_cols:
+            # Scale continuous columns
             mean_val = np.mean(col_data)
             std_val = np.std(col_data)
-            # Replace zero std with 1 to avoid division by zero
             if std_val == 0:
                 std_val = 1.0
             scaled_data = (col_data - mean_val) / std_val
-            # Handle NaN values from zero std
             scaled_data = scaled_data.fillna(0.0)
             processed_static.append(scaled_data)
         else:
+            # Keep categorical columns as is (including landmark_cat)
             processed_static.append(col_data)
     
     static_features = pd.concat(processed_static, axis=1)
-    
-    scaling_params = {
-        'output_means': mean_outcomes,
-        'output_stds': std_outcomes,
-    }
     
     # Save scaling info directly here
     import pickle
@@ -268,8 +231,6 @@ def load_synthetic_neonatal_data(data_path: str,
     output_dir = root_dir / 'outputs'
     output_dir.mkdir(exist_ok=True)
     scaler_info = {
-        'output_means': mean_outcomes,
-        'output_stds': std_outcomes,
         'treatments_mean': treatments_mean,
         'treatments_std': treatments_std,
         'vitals_mean': mean_vitals.values if not vitals.empty else None,
@@ -281,7 +242,13 @@ def load_synthetic_neonatal_data(data_path: str,
         pickle.dump(scaler_info, f)
     logger.info(f"Saved scaler to {output_dir / 'data_scaler.pkl'}")
     
-    return treatments, outcomes, vitals, static_features, outcomes_unscaled, scaling_params
+    # Create scaling_params for compatibility
+    scaling_params = scaler_info
+
+    # outcomes_bucket was already calculated before landmark filtering
+    # Just extract it from filtered_df with the same MultiIndex structure
+    outcomes_bucket = filtered_df["outcomes_bucket"].to_frame()
+    return treatments, outcomes, vitals, static_features, scaling_params, outcomes_bucket
 
 
 class SyntheticNeonatalDatasetCollection(MIMIC3RealDatasetCollection):
@@ -295,6 +262,8 @@ class SyntheticNeonatalDatasetCollection(MIMIC3RealDatasetCollection):
                  treatment_columns: list,
                  outcome_columns: list,
                  outcome_types: list,
+                 horizons: list,
+                 landmarks: list,
                  timestamp_column: str,
                  min_seq_length: int = 30,
                  max_seq_length: int = 80,
@@ -306,7 +275,6 @@ class SyntheticNeonatalDatasetCollection(MIMIC3RealDatasetCollection):
                  right_censor: bool = False,
                  min_length_filter: bool = False,
                  one_seq_per_patient_eval: bool = False,
-                 outcome_shift: int = 0,
                  **kwargs):
         """
         Args:
@@ -323,7 +291,6 @@ class SyntheticNeonatalDatasetCollection(MIMIC3RealDatasetCollection):
             split: Ratio of train / val / test split
             projection_horizon: Range of tau-step-ahead prediction
             autoregressive: Whether to use autoregressive mode
-            outcome_shift: Number of days to shift outcomes earlier (0 = predict same day, 1 = predict 1 day ahead)
         """
         # Load data directly here instead of relying on parent's init
         self.seed = seed
@@ -333,8 +300,10 @@ class SyntheticNeonatalDatasetCollection(MIMIC3RealDatasetCollection):
         self.outcome_types = outcome_types
         self.min_length_filter = min_length_filter
         self.one_seq_per_patient_eval = one_seq_per_patient_eval
-        
-        treatments, outcomes, vitals, static_features, outcomes_unscaled, scaling_params = \
+        self.horizons = horizons
+        self.landmarks = landmarks
+        self.vital_columns = vital_columns
+        treatments, outcomes, vitals, static_features, scaling_params, outcomes_bucket = \
             load_synthetic_neonatal_data(
                 ROOT_PATH + '/' + path,
                 vital_columns=vital_columns,
@@ -347,62 +316,81 @@ class SyntheticNeonatalDatasetCollection(MIMIC3RealDatasetCollection):
                 max_seq_length=max_seq_length,
                 max_number=max_number,
                 data_seed=seed,
-                right_censor=right_censor,
-                outcome_shift=outcome_shift
+                horizons=horizons,
+                landmarks=landmarks,
             )
         
-        # Train/val/test random_split
+        # Train/val/test random_split at person level (not subject_id level)
+        # Extract unique person_ids from subject_ids
+        static_features['person_id'] = static_features.index.str.replace(r'_L\d+', '', regex=True)
+        unique_person_ids = static_features['person_id'].unique()
         
-        static_features, static_features_test = train_test_split(static_features, test_size=split['test'], random_state=seed)
+        # Split at person level
+        train_val_persons, test_persons = train_test_split(unique_person_ids, test_size=split['test'], random_state=seed)
+        
+        # Create masks for static features based on person_id
+        static_features_test = static_features[static_features['person_id'].isin(test_persons)]
+        static_features = static_features[static_features['person_id'].isin(train_val_persons)]
+        
+        # Drop the temporary person_id column
+        static_features = static_features.drop('person_id', axis=1)
+        static_features_test = static_features_test.drop('person_id', axis=1)
         
         
         # Fix MultiIndex selection issue - properly select all timesteps for each patient
         train_val_mask = treatments.index.get_level_values('subject_id').isin(static_features.index)
         test_mask = treatments.index.get_level_values('subject_id').isin(static_features_test.index)
         
-        treatments, outcomes, vitals, outcomes_unscaled, treatments_test, outcomes_test, vitals_test, outcomes_unscaled_test = \
+        treatments, outcomes, vitals, outcomes_bucket, treatments_test, outcomes_test, vitals_test, outcomes_bucket_test = \
             treatments.loc[train_val_mask], \
             outcomes.loc[train_val_mask], \
             vitals.loc[train_val_mask] if not vitals.empty else vitals, \
-            outcomes_unscaled.loc[train_val_mask], \
+            outcomes_bucket.loc[train_val_mask], \
             treatments.loc[test_mask], \
             outcomes.loc[test_mask], \
             vitals.loc[test_mask] if not vitals.empty else vitals, \
-            outcomes_unscaled.loc[test_mask]
-            
+            outcomes_bucket.loc[test_mask]            
 
         if split['val'] > 0.0:
-            static_features_train, static_features_val = train_test_split(static_features,
-                                                                          test_size=split['val'] / (1 - split['test']),
-                                                                          random_state=2 * seed)
+            # Split at person level for train/val too
+            static_features['person_id'] = static_features.index.str.replace(r'_L\d+', '', regex=True)
+            unique_train_val_persons = static_features['person_id'].unique()
+            
+            train_persons, val_persons = train_test_split(unique_train_val_persons,
+                                                          test_size=split['val'] / (1 - split['test']),
+                                                          random_state=2 * seed)
+            
+            static_features_train = static_features[static_features['person_id'].isin(train_persons)]
+            static_features_val = static_features[static_features['person_id'].isin(val_persons)]
+            
+            # Drop the temporary person_id column
+            static_features_train = static_features_train.drop('person_id', axis=1)
+            static_features_val = static_features_val.drop('person_id', axis=1)
             # Fix MultiIndex selection for train/val split too
             train_mask = treatments.index.get_level_values('subject_id').isin(static_features_train.index)
             val_mask = treatments.index.get_level_values('subject_id').isin(static_features_val.index)
             
-            treatments_train, outcomes_train, vitals_train, outcomes_unscaled_train, treatments_val, outcomes_val, vitals_val, \
-                outcomes_unscaled_val = \
+            treatments_train, outcomes_train, vitals_train, outcomes_bucket_train, treatments_val, outcomes_val, vitals_val, outcomes_bucket_val = \
                 treatments.loc[train_mask], \
                 outcomes.loc[train_mask], \
                 vitals.loc[train_mask] if not vitals.empty else vitals, \
-                outcomes_unscaled.loc[train_mask], \
+                outcomes_bucket.loc[train_mask], \
                 treatments.loc[val_mask], \
                 outcomes.loc[val_mask], \
                 vitals.loc[val_mask] if not vitals.empty else vitals, \
-                outcomes_unscaled.loc[val_mask]
+                outcomes_bucket.loc[val_mask]
         else:
             static_features_train = static_features
-            treatments_train, outcomes_train, vitals_train, outcomes_unscaled_train = \
-                treatments, outcomes, vitals, outcomes_unscaled
+            treatments_train, outcomes_train, vitals_train, outcomes_bucket_train = \
+                treatments, outcomes, vitals, outcomes_bucket
+            # For no validation split case, define empty val variables
+            treatments_val = outcomes_val = vitals_val = outcomes_bucket_val = static_features_val = None
 
-        self.train_f = MIMIC3RealDataset(treatments_train, outcomes_train, vitals_train, static_features_train,
-                                         outcomes_unscaled_train, scaling_params, 'train')
+        self.train_f = MIMIC3RealDataset(treatments_train, outcomes_train, vitals_train, outcomes_bucket_train, static_features_train, scaling_params, 'train')
         if split['val'] > 0.0:
-            self.val_f = MIMIC3RealDataset(treatments_val, outcomes_val, vitals_val, static_features_val, outcomes_unscaled_val,
-                                           scaling_params, 'val')
-        self.test_f = MIMIC3RealDataset(treatments_test, outcomes_test, vitals_test, static_features_test, outcomes_unscaled_test,
-                                        scaling_params, 'test')
+            self.val_f = MIMIC3RealDataset(treatments_val, outcomes_val, vitals_val, outcomes_bucket_val, static_features_val, scaling_params, 'val')
+        self.test_f = MIMIC3RealDataset(treatments_test, outcomes_test, vitals_test, outcomes_bucket_test, static_features_test, scaling_params, 'test')
         
-
         # Save patient splits after all splits are done
         import pickle
         patient_splits = {

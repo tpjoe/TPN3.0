@@ -20,7 +20,7 @@ from tqdm import tqdm
 from scipy.stats import pearsonr
 
 from src.data import RealDatasetCollection, SyntheticDatasetCollection
-from src.models.utils import grad_reverse, BRTreatmentOutcomeHead, AlphaRise, bce
+from src.models.utils import grad_reverse, BRTreatmentOutcomeHead, AlphaRise, bce, pc_hazard_loss
 
 logger = logging.getLogger(__name__)
 ray_constants.FUNCTION_SIZE_ERROR_THRESHOLD = 10**8  # ~ 100Mb
@@ -50,7 +50,7 @@ def train_eval_factual(args: dict, train_f: Dataset, val_f: Dataset, orig_hparam
         model = model_cls(new_params, **kwargs).double()
 
     train_loader = DataLoader(train_f, shuffle=True, batch_size=new_params.model[model_cls.model_type]['batch_size'],
-                              drop_last=True)
+                              drop_last=True, num_workers=4)
     trainer = Trainer(gpus=eval(str(new_params.exp.gpus))[:1],
                       logger=None,
                       max_epochs=new_params.exp.max_epochs,
@@ -116,9 +116,16 @@ class TimeVaryingCausalModel(LightningModule):
         if isinstance(self.dim_outcome, (list, ListConfig)):
             self.dim_outcome_list = list(self.dim_outcome)
             # Initialize GradNorm parameters for multitask learning if enabled
-            self.num_tasks = len(self.dim_outcome_list)
+            self.num_outcomes = len(self.dim_outcome_list)
             use_gradnorm = getattr(args.dataset, 'use_gradnorm', False) if 'dataset' in args else False
-            if self.num_tasks > 1 and use_gradnorm:
+            
+            # Check if we have bucket heads (survival analysis)
+            has_buckets = hasattr(args.model, 'num_buckets') and args.model.num_buckets is not None and args.model.num_buckets > 0
+            
+            if use_gradnorm:
+                # Calculate total number of tasks (each outcome can have binary + bucket heads)
+                self.num_tasks = self.num_outcomes * (2 if has_buckets else 1)
+                
                 # Task weights for GradNorm (learnable)
                 self.register_parameter('task_weights', nn.Parameter(torch.ones(self.num_tasks)))
                 # Initial task losses for relative training rate
@@ -126,8 +133,27 @@ class TimeVaryingCausalModel(LightningModule):
                 self.register_buffer('task_loss_history', torch.zeros(self.num_tasks))
                 self.gradnorm_alpha = getattr(args.dataset, 'gradnorm_alpha', 1.5) if 'dataset' in args else 1.5
                 self.training_steps = 0
+                self.has_bucket_heads = has_buckets
         else:
             self.dim_outcome_list = None
+            self.num_outcomes = 1
+            use_gradnorm = getattr(args.dataset, 'use_gradnorm', False) if 'dataset' in args else False
+            
+            # Check if we have bucket heads (survival analysis)
+            has_buckets = hasattr(args.model, 'num_buckets') and args.model.num_buckets is not None and args.model.num_buckets > 0
+            
+            if use_gradnorm:
+                # Calculate total number of tasks (single outcome can have binary + bucket heads)
+                self.num_tasks = 2 if has_buckets else 1
+                
+                # Task weights for GradNorm (learnable)
+                self.register_parameter('task_weights', nn.Parameter(torch.ones(self.num_tasks)))
+                # Initial task losses for relative training rate
+                self.register_buffer('initial_task_losses', torch.zeros(self.num_tasks))
+                self.register_buffer('task_loss_history', torch.zeros(self.num_tasks))
+                self.gradnorm_alpha = getattr(args.dataset, 'gradnorm_alpha', 1.5) if 'dataset' in args else 1.5
+                self.training_steps = 0
+                self.has_bucket_heads = has_buckets
         
         # Debug output
         # print(f"TimeVaryingModel init - dim_outcome: {self.dim_outcome}, type: {type(self.dim_outcome)}")
@@ -179,10 +205,10 @@ class TimeVaryingCausalModel(LightningModule):
 
     def train_dataloader(self) -> DataLoader:
         sub_args = self.hparams.model[self.model_type]
-        return DataLoader(self.dataset_collection.train_f, shuffle=True, batch_size=sub_args['batch_size'], drop_last=True)
+        return DataLoader(self.dataset_collection.train_f, shuffle=True, batch_size=sub_args['batch_size'], drop_last=True, num_workers=4)
 
     def val_dataloader(self) -> DataLoader:
-        return DataLoader(self.dataset_collection.val_f, batch_size=self.hparams.dataset.val_batch_size)
+        return DataLoader(self.dataset_collection.val_f, batch_size=self.hparams.dataset.val_batch_size, num_workers=4)
 
     def get_predictions(self, dataset: Dataset) -> np.array:
         raise NotImplementedError()
@@ -201,7 +227,7 @@ class TimeVaryingCausalModel(LightningModule):
             for t in range(self.hparams.dataset.projection_horizon):
                 logger.info(f't = {t + 2}')
 
-                outputs_scaled = self.get_predictions(dataset)
+                outputs_scaled, _ = self.get_predictions(dataset)
                 predicted_outputs[:, t] = outputs_scaled[:, t]
 
                 if t < (self.hparams.dataset.projection_horizon - 1):
@@ -242,29 +268,7 @@ class TimeVaryingCausalModel(LightningModule):
         logger.info(f'Binary classification metrics calculation for {dataset.subset_name}.')
         
         # Get predictions (logits)
-        outputs_logits = self.get_predictions(dataset)
-        # Extract specific outcome if specified
-        if outcome_idx is not None:
-            # Get dimension info from config
-            # For multitask models with combined head, we know the structure from dataset
-            if hasattr(self.dataset_collection, 'outcome_columns') and len(self.dataset_collection.outcome_columns) > 1:
-                # Reconstruct dimensions from config - all outcomes have dim 1 in our case
-                dim_list = [1] * len(self.dataset_collection.outcome_columns)
-                dim_start = sum(dim_list[:outcome_idx])
-                dim_end = dim_start + dim_list[outcome_idx]
-                # Extract the specific outcome
-            else:
-                # Single outcome case
-                dim_start = 0
-                # Handle both list and scalar cases
-                if isinstance(self.dim_outcome, (list, ListConfig)):
-                    dim_end = sum(self.dim_outcome)  # Sum all dimensions
-                else:
-                    dim_end = self.dim_outcome
-            
-            # Only slice if we have multiple output dimensions
-            if outputs_logits.shape[-1] > 1:
-                outputs_logits = outputs_logits[:, :, dim_start:dim_end]
+        outputs_logits, _ = self.get_predictions(dataset)
         
         # Apply sigmoid to get probabilities
         outputs_probs = 1 / (1 + np.exp(-outputs_logits))
@@ -274,30 +278,32 @@ class TimeVaryingCausalModel(LightningModule):
         y_true_last = []
         y_probs_last = []
         patient_indices_used = []
+        sequence_lengths = dataset.data['sequence_lengths']
         
-        # Get sequence lengths if filtering is requested
-        if min_seq_length is not None and 'sequence_lengths' in dataset.data:
-            sequence_lengths = dataset.data['sequence_lengths']
-        else:
-            sequence_lengths = None
-        
+        # If landmarks are configured, only use highest landmark (full sequence) for each patient
+        highest_landmark_value = None
+        if hasattr(self.dataset_collection, 'landmarks') and self.dataset_collection.landmarks:
+            # Highest landmark is max(landmarks) + 1
+            highest_landmark_value = len(self.dataset_collection.landmarks)  # This will be the categorical index
+            
         for i in range(n_patients):
             # Skip patients with insufficient sequence length
-            if sequence_lengths is not None and sequence_lengths[i] < min_seq_length:
+            if min_seq_length is not None and sequence_lengths is not None and sequence_lengths[i] < min_seq_length:
                 continue
+                
+            # If landmarks configured, skip if not highest landmark
+            if highest_landmark_value is not None:
+                static_features = dataset.data['static_features'][i]
+                patient_landmark_cat = static_features[-1]  # landmark_cat is last column
+                if patient_landmark_cat != highest_landmark_value:
+                    continue
                 
             # Find the last active timestep for this patient
             active_mask = dataset.data['active_entries'][i, :, 0].astype(bool)
-            if active_mask.any():
-                last_active_idx = np.where(active_mask)[0][-1]
-                if outcome_idx is not None:
-                    # Extract specific outcome - outputs_probs is already sliced, but dataset.data['outputs'] is not
-                    y_true_last.append(dataset.data['outputs'][i, last_active_idx, outcome_idx])
-                    y_probs_last.append(outputs_probs[i, last_active_idx, 0])  # Already sliced above
-                else:
-                    y_true_last.append(dataset.data['outputs'][i, last_active_idx, 0])
-                    y_probs_last.append(outputs_probs[i, last_active_idx, 0])
-                patient_indices_used.append(i)
+            last_active_idx = np.where(active_mask)[0][-1]
+            y_true_last.append(dataset.data['outputs'][i, last_active_idx, 0])
+            y_probs_last.append(outputs_probs[i, last_active_idx, 0])
+            patient_indices_used.append(i)
         
         y_true_last = np.array(y_true_last)
         y_probs_last = np.array(y_probs_last)
@@ -308,20 +314,160 @@ class TimeVaryingCausalModel(LightningModule):
         n_negatives = np.sum(y_true_last == 0)
         logger.info(f'  Binary classification breakdown: {n_positives} cases, {n_negatives} controls (from {len(y_true_last)} patients)')
         
-        
-        if len(np.unique(y_true_last)) > 1:
-            auc_roc = roc_auc_score(y_true_last, y_probs_last)
-            auc_pr = average_precision_score(y_true_last, y_probs_last)
-        else:
-            auc_roc = np.nan
-            auc_pr = np.nan
+        auc_roc = roc_auc_score(y_true_last, y_probs_last) if len(np.unique(y_true_last)) > 1 else np.nan
+        auc_pr = average_precision_score(y_true_last, y_probs_last) if len(np.unique(y_true_last)) > 1 else np.nan
         
         logger.info(f'Using {len(y_true_last)} patients\' last predictions for AUC calculation')
         if min_seq_length is not None:
             logger.info(f'  (filtered to patients with at least {min_seq_length} timesteps)')
         logger.info(f'Test set breakdown: {np.sum(y_true_last == 1)} cases, {np.sum(y_true_last == 0)} controls')
         
-        return auc_roc, auc_pr
+        # Return metrics and counts
+        return auc_roc, auc_pr, n_positives, n_negatives
+
+    def get_bucket_classification_metrics(self, dataset: Dataset, min_seq_length: int = None, outcome_idx: int = None, per_bucket: bool = False, landmark: int = None):
+        """
+        Calculate binary classification metrics for bucket predictions: AUC-ROC and AUC-PR using last prediction per patient.
+        
+        Args:
+            dataset: Dataset to evaluate
+            min_seq_length: If provided, only include patients with at least this many timesteps
+            outcome_idx: If provided, only evaluate this outcome index (for multi-outcome models)
+            per_bucket: If True, return metrics for each bucket separately as lists
+            landmark: If provided, only include patients whose last active day_since_birth == landmark
+        """
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        from src.models.utils import hazard_to_event_prob
+        
+        logger.info(f'Bucket binary classification metrics calculation for {dataset.subset_name}.')
+        
+        # Get bucket predictions (raw hazard predictions)
+        _, bucket_hazards = self.get_predictions(dataset)
+        
+        # Convert hazards to event probabilities
+        # bucket_hazards shape: (n_patients, n_timesteps, n_buckets)
+        # We need to convert to torch tensor, apply conversion, then back to numpy
+        bucket_hazards_tensor = torch.from_numpy(bucket_hazards)
+        event_probs_tensor = hazard_to_event_prob(bucket_hazards_tensor.view(-1, bucket_hazards_tensor.shape[-1]))
+        outputs_probs = event_probs_tensor.view(bucket_hazards.shape).numpy()
+        
+        # Get last valid prediction per patient
+        n_patients, n_timesteps, n_buckets = outputs_probs.shape
+        y_true_last = []
+        y_probs_last = []
+        y_probs_per_bucket = [[] for _ in range(n_buckets)] if per_bucket else None
+        y_true_per_bucket = [[] for _ in range(n_buckets)] if per_bucket else None
+        patient_indices_used = []
+        sequence_lengths = dataset.data['sequence_lengths']
+        
+        # Get landmark_cat column index if landmark filtering is requested
+        landmark_cat_idx = None
+        if landmark is not None:
+            # Map landmark value to categorical index
+            if self.dataset_collection.landmarks:
+                # Need to include the "full sequence" landmark (max(landmarks) + 1)
+                unique_landmarks = sorted(self.dataset_collection.landmarks) + [max(self.dataset_collection.landmarks) + 1]
+            else:
+                # No landmarks configured - only one value (0)
+                unique_landmarks = [0]
+            
+            landmark_to_idx = {lm: idx for idx, lm in enumerate(unique_landmarks)}
+            if landmark not in landmark_to_idx:
+                logger.warning(f"Landmark {landmark} not found in configured landmarks {unique_landmarks}")
+                return np.nan, np.nan if not per_bucket else ([], [], [], [])
+            landmark_cat_value = landmark_to_idx[landmark]
+        
+        for i in range(n_patients):
+            # Skip patients with insufficient sequence length
+            if min_seq_length is not None and sequence_lengths is not None and sequence_lengths[i] < min_seq_length:
+                continue
+                
+            # Find the last active timestep for this patient
+            active_mask = dataset.data['active_entries'][i, :, 0].astype(bool)
+            last_active_idx = np.where(active_mask)[0][-1]
+            
+            # Skip if landmark filtering is requested and patient doesn't match
+            if landmark is not None:
+                # Get landmark_cat from static features (last column we added)
+                static_features = dataset.data['static_features'][i]
+                # landmark_cat is the last column in static features
+                patient_landmark_cat = static_features[-1]
+                # Check if this patient belongs to the requested landmark
+                if patient_landmark_cat != landmark_cat_value:
+                    continue
+            
+            # Get the bucket index for this patient
+            bucket_idx = dataset.data['outputs_bucket'][i, last_active_idx, 0]
+            
+            # True label: did the patient have the event within the defined buckets?
+            # bucket_idx < n_buckets means event occurred within defined timeframe (case)
+            # bucket_idx == n_buckets means censored or event outside timeframe (control)
+            y_true = 1 if bucket_idx < n_buckets else 0
+            y_true_last.append(y_true)
+            
+            # Predicted probability: cumulative event probability by last bucket
+            # outputs_probs[i, last_active_idx, -1] gives P(event by last bucket)
+            y_probs_last.append(outputs_probs[i, last_active_idx, -1])
+            
+            # Per-bucket metrics if requested
+            if per_bucket:
+                for b in range(n_buckets):
+                    # True label for bucket b: did event occur in bucket b specifically?
+                    # Event occurred in bucket b if bucket_idx == b (non-cumulative)
+                    y_true_b = 1 if (bucket_idx <= b and bucket_idx < n_buckets) else 0
+                    y_true_per_bucket[b].append(y_true_b)
+                    # Predicted probability for bucket b
+                    y_probs_per_bucket[b].append(outputs_probs[i, last_active_idx, b])
+            
+            patient_indices_used.append(i)
+
+        y_true_last = np.array(y_true_last)
+        y_probs_last = np.array(y_probs_last)
+        
+        # Calculate metrics
+        # Always log the case/control breakdown
+        n_positives = np.sum(y_true_last == 1)
+        n_negatives = np.sum(y_true_last == 0)
+        logger.info(f'  Bucket binary classification breakdown: {n_positives} cases, {n_negatives} controls (from {len(y_true_last)} patients)')
+        
+        auc_roc = roc_auc_score(y_true_last, y_probs_last) if len(np.unique(y_true_last)) > 1 else np.nan
+        auc_pr = average_precision_score(y_true_last, y_probs_last) if len(np.unique(y_true_last)) > 1 else np.nan
+        
+        # print(f'Using {np.sum(y_true_last == 1)} case and {np.sum(y_true_last == 0)} controls patients\' last bucket predictions for AUC calculation')
+        logger.info(f'Bucket test set breakdown: {np.sum(y_true_last == 1)} cases, {np.sum(y_true_last == 0)} controls')
+        
+        if per_bucket:
+            # Calculate metrics for each bucket
+            auc_roc_list = []
+            auc_pr_list = []
+            
+            n_cases_list = []
+            n_controls_list = []
+            
+            for b in range(n_buckets):
+                y_true_b = np.array(y_true_per_bucket[b])
+                y_probs_b = np.array(y_probs_per_bucket[b])
+                
+                n_pos_b = np.sum(y_true_b == 1)
+                n_neg_b = np.sum(y_true_b == 0)
+                logger.info(f'  Bucket {b}: {n_pos_b} cases, {n_neg_b} controls')
+                
+                n_cases_list.append(n_pos_b)
+                n_controls_list.append(n_neg_b)
+                
+                if len(np.unique(y_true_b)) > 1:
+                    auc_roc_b = roc_auc_score(y_true_b, y_probs_b)
+                    auc_pr_b = average_precision_score(y_true_b, y_probs_b)
+                else:
+                    auc_roc_b = np.nan
+                    auc_pr_b = np.nan
+                
+                auc_roc_list.append(auc_roc_b)
+                auc_pr_list.append(auc_pr_b)
+            
+            return auc_roc_list, auc_pr_list, n_cases_list, n_controls_list
+        else:
+            return auc_roc, auc_pr
 
     def evaluate_one_seq_per_patient_binary(self, dataset: Dataset, projection_horizon: int = 5, use_ground_truth_feedback: bool = False):
         """
@@ -568,146 +714,6 @@ class TimeVaryingCausalModel(LightningModule):
         
         return auc_rocs, auc_prs
 
-    def get_normalised_masked_rmse(self, dataset: Dataset, one_step_counterfactual=False, outcome_idx: int = None):
-        logger.info(f'RMSE calculation for {dataset.subset_name}.')
-        outputs_scaled = self.get_predictions(dataset)
-        
-        # Extract specific outcome if specified
-        if outcome_idx is not None:
-            # Get dimension info from config
-            if isinstance(self.dim_outcome, (list, ListConfig)):
-                dim_start = sum(self.dim_outcome[:outcome_idx])
-                dim_end = dim_start + self.dim_outcome[outcome_idx]
-            else:
-                # Single outcome case - this shouldn't happen if outcome_idx is provided
-                dim_start = 0
-                dim_end = self.dim_outcome
-            outputs_scaled = outputs_scaled[:, :, dim_start:dim_end]
-            
-            # Also extract corresponding ground truth
-            outputs_true = dataset.data['outputs'][:, :, dim_start:dim_end]
-            outputs_unscaled_true = dataset.data['unscaled_outputs'][:, :, dim_start:dim_end] if 'unscaled_outputs' in dataset.data else None
-            active_entries = dataset.data['active_entries'][:, :, dim_start:dim_end]
-            
-            # Get unscale setting for this outcome
-            if hasattr(self.hparams.exp.unscale_rmse, 'get'):
-                # Dictionary format
-                outcome_name = self.dataset_collection.outcome_columns[outcome_idx]
-                unscale = self.hparams.exp.unscale_rmse.get(outcome_name, False)
-            else:
-                unscale = self.hparams.exp.unscale_rmse
-        else:
-            unscale = self.hparams.exp.unscale_rmse
-            outputs_true = dataset.data['outputs']
-            outputs_unscaled_true = dataset.data['unscaled_outputs'] if 'unscaled_outputs' in dataset.data else None
-            active_entries = dataset.data['active_entries']
-            
-        percentage = self.hparams.exp.percentage_rmse
-
-        if unscale:
-            output_stds, output_means = dataset.scaling_params['output_stds'], dataset.scaling_params['output_means']
-            
-            # Handle dictionary format when we have multiple outcomes
-            if isinstance(output_stds, dict) and outcome_idx is not None:
-                outcome_name = self.dataset_collection.outcome_columns[outcome_idx]
-                std = output_stds[outcome_name]
-                mean = output_means[outcome_name]
-                outputs_unscaled = outputs_scaled * std + mean
-            elif isinstance(output_stds, dict):
-                # Multiple outcomes but no specific index - this shouldn't happen in practice
-                raise ValueError("Multiple outcomes but no outcome_idx specified for unscaling")
-            else:
-                # Single outcome case
-                outputs_unscaled = outputs_scaled * output_stds + output_means
-
-            # Batch-wise masked-MSE calculation is tricky, thus calculating for full dataset at once
-            mse = ((outputs_unscaled - outputs_unscaled_true) ** 2) * active_entries
-        else:
-            # Batch-wise masked-MSE calculation is tricky, thus calculating for full dataset at once
-            mse = ((outputs_scaled - outputs_true) ** 2) * active_entries
-
-        # Calculation like in original paper (Masked-Averaging over datapoints (& outputs) and then non-masked time axis)
-        mse_orig = mse.sum(0).sum(-1) / active_entries.sum(0).sum(-1)
-        mse_orig = mse_orig.mean()
-        rmse_normalised_orig = np.sqrt(mse_orig) / dataset.norm_const
-
-        # Masked averaging over all dimensions at once
-        mse_all = mse.sum() / active_entries.sum()
-        rmse_normalised_all = np.sqrt(mse_all) / dataset.norm_const
-
-        if percentage:
-            rmse_normalised_orig *= 100.0
-            rmse_normalised_all *= 100.0
-
-        if one_step_counterfactual:
-            # Only considering last active entry with actual counterfactuals
-            num_samples, time_dim, output_dim = dataset.data['active_entries'].shape
-            last_entries = dataset.data['active_entries'] - np.concatenate([dataset.data['active_entries'][:, 1:, :],
-                                                                            np.zeros((num_samples, 1, output_dim))], axis=1)
-            if unscale:
-                mse_last = ((outputs_unscaled - dataset.data['unscaled_outputs']) ** 2) * last_entries
-            else:
-                mse_last = ((outputs_scaled - dataset.data['outputs']) ** 2) * last_entries
-
-            mse_last = mse_last.sum() / last_entries.sum()
-            rmse_normalised_last = np.sqrt(mse_last) / dataset.norm_const
-
-            if percentage:
-                rmse_normalised_last *= 100.0
-
-            return rmse_normalised_orig, rmse_normalised_all, rmse_normalised_last
-
-        return rmse_normalised_orig, rmse_normalised_all
-
-    def get_normalised_n_step_rmses(self, dataset: Dataset, datasets_mc: List[Dataset] = None):
-        logger.info(f'RMSE calculation for {dataset.subset_name}.')
-        assert self.model_type == 'decoder' or self.model_type == 'multi' or self.model_type == 'g_net' or \
-               self.model_type == 'msm_regressor'
-        assert hasattr(dataset, 'data_processed_seq')
-
-        unscale = self.hparams.exp.unscale_rmse
-        percentage = self.hparams.exp.percentage_rmse
-        outputs_scaled = self.get_autoregressive_predictions(dataset if datasets_mc is None else datasets_mc)
-
-        if unscale:
-            output_stds, output_means = dataset.scaling_params['output_stds'], dataset.scaling_params['output_means']
-            outputs_unscaled = outputs_scaled * output_stds + output_means
-
-            mse = ((outputs_unscaled - dataset.data_processed_seq['unscaled_outputs']) ** 2) \
-                * dataset.data_processed_seq['active_entries']
-        else:
-            mse = ((outputs_scaled - dataset.data_processed_seq['outputs']) ** 2) * dataset.data_processed_seq['active_entries']
-
-        nan_idx = np.unique(np.where(np.isnan(dataset.data_processed_seq['outputs']))[0])
-        not_nan = np.array([i for i in range(outputs_scaled.shape[0]) if i not in nan_idx])
-
-        # Calculation like in original paper (Masked-Averaging over datapoints (& outputs) and then non-masked time axis)
-        mse_orig = mse[not_nan].sum(0).sum(-1) / dataset.data_processed_seq['active_entries'][not_nan].sum(0).sum(-1)
-        rmses_normalised_orig = np.sqrt(mse_orig) / dataset.norm_const
-
-        if percentage:
-            rmses_normalised_orig *= 100.0
-
-        # Calculate Pearson correlations for each timestep
-        mask = dataset.data_processed_seq['active_entries'][not_nan].astype(bool)
-        pearson_rs = []
-        for t in range(outputs_scaled.shape[1]):
-            mask_t = mask[:, t, :].flatten()
-            if unscale:
-                y_true = dataset.data_processed_seq['unscaled_outputs'][not_nan, t, :].flatten()[mask_t]
-                y_pred = outputs_unscaled[not_nan, t, :].flatten()[mask_t]
-            else:
-                y_true = dataset.data_processed_seq['outputs'][not_nan, t, :].flatten()[mask_t]
-                y_pred = outputs_scaled[not_nan, t, :].flatten()[mask_t]
-            
-            if len(y_true) > 1:  # Need at least 2 points for correlation
-                r, _ = pearsonr(y_true, y_pred)
-                pearson_rs.append(r)
-            else:
-                pearson_rs.append(np.nan)
-        
-        return rmses_normalised_orig, np.array(pearson_rs)
-
     @staticmethod
     def set_hparams(model_args: DictConfig, new_args: dict, input_size: int, model_type: str):
         raise NotImplementedError()
@@ -787,6 +793,31 @@ class TimeVaryingCausalModel(LightningModule):
     def on_fit_end(self) -> None:  # Issue with logging not yet existing parameters in MlFlow
         if self.trainer.logger is not None:
             self.trainer.logger.filter_submodels = list(self.possible_model_types)
+    
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        """Save EMA states to checkpoint if available"""
+        super().on_save_checkpoint(checkpoint)
+        
+        # Check if model has EMA
+        if hasattr(self, 'ema_treatment') and hasattr(self, 'ema_non_treatment'):
+            # Save EMA states
+            checkpoint['ema_treatment_state'] = self.ema_treatment.state_dict()
+            checkpoint['ema_non_treatment_state'] = self.ema_non_treatment.state_dict()
+            
+            # Also save a version with EMA weights applied
+            with self.ema_non_treatment.average_parameters():
+                with self.ema_treatment.average_parameters():
+                    checkpoint['ema_state_dict'] = self.state_dict()
+    
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Load EMA states from checkpoint if available"""
+        super().on_load_checkpoint(checkpoint)
+        
+        # Check if checkpoint has EMA states and model has EMA
+        if hasattr(self, 'ema_treatment') and 'ema_treatment_state' in checkpoint:
+            self.ema_treatment.load_state_dict(checkpoint['ema_treatment_state'])
+        if hasattr(self, 'ema_non_treatment') and 'ema_non_treatment_state' in checkpoint:
+            self.ema_non_treatment.load_state_dict(checkpoint['ema_non_treatment_state'])
 
 
 class BRCausalModel(TimeVaryingCausalModel):
@@ -889,16 +920,29 @@ class BRCausalModel(TimeVaryingCausalModel):
 
         if optimizer_idx == 0:  # grad reversal or domain confusion representation update
             if self.hparams.exp.weights_ema:
-                with self.ema_treatment.average_parameters():
-                    treatment_pred, outcome_pred, _ = self(batch)
+                with self.ema_non_treatment.average_parameters():
+                    with self.ema_treatment.average_parameters():
+                        treatment_pred, outcome_pred, _, bucket_pred = self(batch)
             else:
-                treatment_pred, outcome_pred, _ = self(batch)
+                treatment_pred, outcome_pred, _, bucket_pred = self(batch)
 
             # Handle multiple outcomes
             if isinstance(outcome_pred, dict):
                 # Multiple outcomes - calculate loss for each
-                outcome_losses = {}
+                outcome_losses = {}  # Raw losses
+                masked_outcome_losses = {}  # Masked losses for logging and calculation
                 task_losses = []  # For GradNorm
+                
+                # Determine mask once before processing outcomes
+                if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                    # Create mask for last timepoint only
+                    last_timepoint_mask = torch.zeros_like(batch['active_entries'])
+                    for i, seq_len in enumerate(batch['sequence_lengths']):
+                        last_timepoint_mask[i, seq_len-1, :] = 1.0
+                    mask = last_timepoint_mask
+                else:
+                    # Use all active timepoints
+                    mask = batch['active_entries']
                 
                 # Split batch outputs by outcome
                 start_idx = 0
@@ -910,30 +954,60 @@ class BRCausalModel(TimeVaryingCausalModel):
                                                          dim_list))):
                     end_idx = start_idx + dim
                     outcome_target = batch['outputs'][:, :, start_idx:end_idx]
+                    outcome_bucket = batch['outputs_bucket'][:, :, start_idx:end_idx]
                     
-                    if otype == 'binary':
-                        # Use BCE loss for binary outcomes
-                        loss = F.binary_cross_entropy_with_logits(outcome_pred[outcome_name], outcome_target, reduce=False)
-                    else:
-                        # Use MSE loss for continuous outcomes
-                        loss = F.mse_loss(outcome_pred[outcome_name], outcome_target, reduce=False)
+                    # Calculate raw losses
+                    loss = F.binary_cross_entropy_with_logits(outcome_pred[outcome_name], outcome_target, reduction='none')
                     
-                    outcome_losses[outcome_name] = loss
-                    
-                    # Check if we should only use last timepoint
+                    # Bucket loss can only be activated if last_timepoint_only is True
                     if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
-                        # Create mask for last timepoint only
-                        last_timepoint_mask = torch.zeros_like(batch['active_entries'])
-                        for i, seq_len in enumerate(batch['sequence_lengths']):
-                            last_timepoint_mask[i, seq_len-1, :] = 1.0
-                        mask = last_timepoint_mask
+                        # Get sequence lengths
+                        seq_lengths = batch['sequence_lengths']
+                        batch_size = outcome_bucket.shape[0]
+                        
+                        # Extract event time bucket and indicator from last valid timestep
+                        last_indices = seq_lengths.long() - 1
+                        batch_indices = torch.arange(batch_size, device=outcome_bucket.device)
+                        
+                        # Screen outputs and outputs_bucket by their last timepoint
+                        event_bucket = outcome_bucket[batch_indices, last_indices, 0].long()  # Event time bucket
+                        event_indicator = outcome_target[batch_indices, last_indices, 0]      # Event indicator
+
+                        # Derive correct event_indicator: set to 0 if outside defined buckets
+                        num_buckets = bucket_pred[outcome_name].shape[-1]  # Get number of buckets from model
+                        outside_range_mask = event_bucket >= num_buckets
+                        event_indicator = event_indicator * (~outside_range_mask).float()  # Set to 0 if outside range
+                        
+                        # Extract last timepoint predictions for bucket loss
+                        bucket_pred_last = bucket_pred[outcome_name][batch_indices, last_indices, :]
+
+                        focal_gamma = getattr(self.hparams.model.multi, 'focal_gamma', 0.0)
+                        loss_bucket = pc_hazard_loss(
+                            bucket_pred_last, 
+                            event_bucket, 
+                            event_indicator, 
+                            reduction='none',
+                            focal_gamma=focal_gamma
+                        )
                     else:
-                        # Use all active timepoints
-                        mask = batch['active_entries']
+                        # Bucket loss not supported for seq2seq mode
+                        loss_bucket = torch.zeros_like(loss)
                     
-                    # Mask and average the loss
+                    # Store raw losses (for potential debugging/other uses)
+                    outcome_losses[outcome_name] = loss
+                    outcome_losses[outcome_name+'_bucket'] = loss_bucket
+                    
+                    # Mask and average the losses
                     masked_loss = (mask * loss).sum() / mask.sum()
+                    masked_bucket_loss = (loss_bucket).sum() / len(loss_bucket)
+                    
+                    # Store masked losses for logging
+                    masked_outcome_losses[outcome_name] = masked_loss
+                    masked_outcome_losses[outcome_name+'_bucket'] = masked_bucket_loss
+                    
+                    # For GradNorm
                     task_losses.append(masked_loss)
+                    task_losses.append(masked_bucket_loss)
                     
                     start_idx = end_idx
                 
@@ -950,20 +1024,72 @@ class BRCausalModel(TimeVaryingCausalModel):
                 else:
                     # Use manual weights if not using GradNorm
                     total_outcome_loss = 0
-                    for outcome_name, loss in outcome_losses.items():
-                        if hasattr(self.hparams.dataset, 'task_weights') and outcome_name in self.hparams.dataset.task_weights:
-                            weight = self.hparams.dataset.task_weights[outcome_name]
+                    for outcome_name, masked_loss in masked_outcome_losses.items():
+                        if hasattr(self.hparams.dataset, 'task_weights') and outcome_name.replace('_bucket', '') in self.hparams.dataset.task_weights:
+                            weight = self.hparams.dataset.task_weights[outcome_name.replace('_bucket', '')]
                         else:
                             weight = 1.0
-                        total_outcome_loss = total_outcome_loss + weight * loss
+                        total_outcome_loss = total_outcome_loss + weight * masked_loss
                 
                 outcome_loss = total_outcome_loss
             else:
                 # Single outcome - original behavior
-                if hasattr(self.dataset_collection, 'outcome_type') and self.dataset_collection.outcome_type == 'binary':
-                    outcome_loss = F.binary_cross_entropy_with_logits(outcome_pred, batch['outputs'], reduce=False)
+                # Calculate raw losses
+                outcome_binary_loss_raw = F.binary_cross_entropy_with_logits(outcome_pred, batch['outputs'], reduction='none')
+                
+                # Bucket loss can only be activated if last_timepoint_only is True
+                if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                    # Get sequence lengths
+                    seq_lengths = batch['sequence_lengths']
+                    batch_size = batch['outputs_bucket'].shape[0]
+                    
+                    # Extract event time bucket and indicator from last valid timestep
+                    last_indices = seq_lengths.long() - 1
+                    batch_indices = torch.arange(batch_size, device=batch['outputs_bucket'].device)
+                    
+                    # Screen outputs and outputs_bucket by their last timepoint
+                    event_bucket = batch['outputs_bucket'][batch_indices, last_indices, 0].long()  # Event time bucket
+                    event_indicator = batch['outputs'][batch_indices, last_indices, 0]            # Event indicator
+                    
+                    # Derive correct event_indicator: set to 0 if outside defined buckets
+                    num_buckets = bucket_pred.shape[-1]  # Get number of buckets from model
+                    outside_range_mask = event_bucket >= num_buckets
+                    event_indicator = event_indicator * (~outside_range_mask).float()  # Set to 0 if outside range
+                    
+                    # Extract last timepoint predictions for bucket loss
+                    bucket_pred_last = bucket_pred[batch_indices, last_indices, :]
+                    
+                    focal_gamma = getattr(self.hparams.model.multi, 'focal_gamma', 0.0)
+                    outcome_bucket_loss_raw = pc_hazard_loss(
+                        bucket_pred_last, 
+                        event_bucket, 
+                        event_indicator, 
+                        reduction='none',
+                        focal_gamma=focal_gamma
+                    )
                 else:
-                    outcome_loss = F.mse_loss(outcome_pred, batch['outputs'], reduce=False)
+                    # Bucket loss not supported for seq2seq mode - use zeros
+                    outcome_bucket_loss_raw = torch.zeros_like(outcome_binary_loss_raw)
+                    
+                # Only apply masking for single outcome case
+                # Check if we should only use last timepoint
+                if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                    # Create mask for last timepoint only
+                    last_timepoint_mask = torch.zeros_like(batch['active_entries'])
+                    for i, seq_len in enumerate(batch['sequence_lengths']):
+                        last_timepoint_mask[i, seq_len-1, :] = 1.0
+                    mask = last_timepoint_mask
+                else:
+                    # Use all active timepoints
+                    mask = batch['active_entries']
+                    
+                # Mask and average the individual losses
+                outcome_binary_loss = (mask * outcome_binary_loss_raw).sum() / mask.sum()
+                outcome_bucket_loss = (outcome_bucket_loss_raw).sum() / len(outcome_bucket_loss_raw)
+                
+                # Sum the masked losses
+                outcome_loss = outcome_binary_loss + outcome_bucket_loss
+                
             if self.balancing == 'grad_reverse':
                 bce_loss = self.bce_loss(treatment_pred, batch['current_treatments'].double(), kind='predict')
             elif self.balancing == 'domain_confusion':
@@ -972,7 +1098,7 @@ class BRCausalModel(TimeVaryingCausalModel):
             else:
                 raise NotImplementedError()
 
-            # Check if we should only use last timepoint
+            # Mask bce_loss
             if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
                 # Create mask for last timepoint only
                 last_timepoint_mask = torch.zeros_like(batch['active_entries'])
@@ -983,9 +1109,7 @@ class BRCausalModel(TimeVaryingCausalModel):
                 # Use all active timepoints
                 mask = batch['active_entries']
             
-            # Masking for shorter sequences
             bce_loss = (mask.squeeze(-1) * bce_loss).sum() / mask.sum()
-            outcome_loss = (mask * outcome_loss).sum() / mask.sum()
 
             loss = bce_loss + outcome_loss
 
@@ -994,16 +1118,24 @@ class BRCausalModel(TimeVaryingCausalModel):
             
             # Log outcome losses
             if isinstance(outcome_pred, dict):
-                # Log individual outcome losses
-                for outcome_name, (otype, loss_val) in zip(self.dataset_collection.outcome_columns,
-                                                          zip(self.dataset_collection.outcome_types, 
-                                                              outcome_losses.values())):
-                    masked_loss = (batch['active_entries'] * loss_val).sum() / batch['active_entries'].sum()
+                # Log individual outcome losses using masked values
+                for outcome_name in self.dataset_collection.outcome_columns:
+                    # Get the outcome type
+                    outcome_idx = self.dataset_collection.outcome_columns.index(outcome_name)
+                    otype = self.dataset_collection.outcome_types[outcome_idx]
+                    
+                    # Get masked losses
+                    masked_loss = masked_outcome_losses[outcome_name]
+                    masked_bucket_loss = masked_outcome_losses[outcome_name+'_bucket']
+                    
                     weight = self.hparams.dataset.task_weights.get(outcome_name, 1.0) if hasattr(self.hparams.dataset, 'task_weights') else 1.0
                     weighted_loss = weight * masked_loss
+                    weighted_bucket_loss = weight * masked_bucket_loss
                     
                     if otype == 'binary':
                         self.log(f'{self.model_type}_train_{outcome_name}_bce_loss', masked_loss, 
+                                on_epoch=True, on_step=False, prog_bar=False, sync_dist=True)
+                        self.log(f'{self.model_type}_train_{outcome_name}_bucket_loss', masked_bucket_loss, 
                                 on_epoch=True, on_step=False, prog_bar=False, sync_dist=True)
                         self.log(f'{self.model_type}_train_{outcome_name}_weighted_loss', weighted_loss, 
                                 on_epoch=True, on_step=False, sync_dist=True)
@@ -1016,10 +1148,8 @@ class BRCausalModel(TimeVaryingCausalModel):
                         on_epoch=True, on_step=False, sync_dist=True)
             else:
                 # Single outcome - original behavior
-                if hasattr(self.dataset_collection, 'outcome_type') and self.dataset_collection.outcome_type == 'binary':
-                    self.log(f'{self.model_type}_train_outcome_bce_loss', outcome_loss, on_epoch=True, on_step=False, sync_dist=True)
-                else:
-                    self.log(f'{self.model_type}_train_mse_loss', outcome_loss, on_epoch=True, on_step=False, sync_dist=True)
+                self.log(f'{self.model_type}_train_outcome_bce_loss', outcome_binary_loss, on_epoch=True, on_step=False, sync_dist=True)
+                self.log(f'{self.model_type}_train_outcome_bucket_loss', outcome_bucket_loss, on_epoch=True, on_step=False, sync_dist=True)
             self.log(f'{self.model_type}_alpha', self.br_treatment_outcome_head.alpha, on_epoch=True, on_step=False,
                      sync_dist=True)
 
@@ -1028,9 +1158,10 @@ class BRCausalModel(TimeVaryingCausalModel):
         elif optimizer_idx == 1:  # domain classifier update
             if self.hparams.exp.weights_ema:
                 with self.ema_non_treatment.average_parameters():
-                    treatment_pred, _, _ = self(batch, detach_treatment=True)
+                    with self.ema_treatment.average_parameters():
+                        treatment_pred, _, _, _ = self(batch, detach_treatment=True)
             else:
-                treatment_pred, _, _ = self(batch, detach_treatment=True)
+                treatment_pred, _, _, _ = self(batch, detach_treatment=True)
 
             bce_loss = self.bce_loss(treatment_pred, batch['current_treatments'].double(), kind='predict')
             if self.balancing == 'domain_confusion':
@@ -1043,107 +1174,47 @@ class BRCausalModel(TimeVaryingCausalModel):
 
             return bce_loss
 
-    def test_step(self, batch, batch_ind, **kwargs):
+
+    def validation_step(self, batch, batch_idx):
+        """Validation step to compute metrics during training or testing"""
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        
+        # Determine subset name from the dataset's subset_name attribute - REQUIRED
+        if hasattr(self.trainer, 'val_dataloaders') and self.trainer.val_dataloaders:
+            current_dataloader = self.trainer.val_dataloaders[0]
+            if hasattr(current_dataloader, 'dataset'):
+                if hasattr(current_dataloader.dataset, 'subset_name'):
+                    subset_name = current_dataloader.dataset.subset_name
+                else:
+                    raise AttributeError(f"Dataset {type(current_dataloader.dataset).__name__} must have 'subset_name' attribute")
+            else:
+                raise AttributeError("Dataloader must have a dataset attribute")
+        else:
+            raise AttributeError("Trainer must have val_dataloaders during validation/test")
+        
+        # Get predictions
         if self.hparams.exp.weights_ema:
             with self.ema_non_treatment.average_parameters():
                 with self.ema_treatment.average_parameters():
-                    treatment_pred, outcome_pred, _ = self(batch)
+                    treatment_pred, outcome_pred, _, bucket_pred = self(batch)
         else:
-            treatment_pred, outcome_pred, _ = self(batch)
-
+            treatment_pred, outcome_pred, _, bucket_pred = self(batch)
+        
         if self.balancing == 'grad_reverse':
             bce_loss = self.bce_loss(treatment_pred, batch['current_treatments'].double(), kind='predict')
         elif self.balancing == 'domain_confusion':
             bce_loss = self.bce_loss(treatment_pred, batch['current_treatments'].double(), kind='confuse')
-
-        # Handle multiple outcomes
-        if isinstance(outcome_pred, dict):
-            # Multiple outcomes - calculate loss for each
-            outcome_losses = {}
-            total_outcome_loss = 0
-            
-            # Split batch outputs by outcome
-            start_idx = 0
-            for outcome_name, (otype, dim) in zip(self.dataset_collection.outcome_columns, 
-                                                 zip(self.dataset_collection.outcome_types, 
-                                                     self.dim_outcome)):
-                end_idx = start_idx + dim
-                outcome_target = batch['outputs'][:, :, start_idx:end_idx]
-                
-                if otype == 'binary':
-                    # Use BCE loss for binary outcomes
-                    loss = F.binary_cross_entropy_with_logits(outcome_pred[outcome_name], outcome_target, reduce=False)
-                else:
-                    # Use MSE loss for continuous outcomes
-                    loss = F.mse_loss(outcome_pred[outcome_name], outcome_target, reduce=False)
-                
-                outcome_losses[outcome_name] = loss
-                total_outcome_loss = total_outcome_loss + loss
-                start_idx = end_idx
-            
-            outcome_loss = total_outcome_loss
-        else:
-            # Single outcome - original behavior
-            if hasattr(self.dataset_collection, 'outcome_type') and self.dataset_collection.outcome_type == 'binary':
-                outcome_loss = F.binary_cross_entropy_with_logits(outcome_pred, batch['outputs'], reduce=False)
-            else:
-                outcome_loss = F.mse_loss(outcome_pred, batch['outputs'], reduce=False)
-
-        # Masking for shorter sequences
-        # Attention! Averaging across all the active entries (= sequence masks) for full batch
-        bce_loss = (batch['active_entries'].squeeze(-1) * bce_loss).sum() / batch['active_entries'].sum()
-        outcome_loss = (batch['active_entries'] * outcome_loss).sum() / batch['active_entries'].sum()
-        loss = bce_loss + outcome_loss
-
-        # Calculate Pearson correlation coefficient for outcomes
-        if isinstance(outcome_pred, dict):
-            # Multiple outcomes - calculate correlation for continuous ones
-            pearson_r = {}
-            mask = batch['active_entries'].cpu().numpy().astype(bool)
-            
-            start_idx = 0
-            # Get dimension list
-            dim_list = self.dim_outcome_list if self.dim_outcome_list is not None else [self.dim_outcome]
-            
-            for outcome_name, (otype, dim) in zip(self.dataset_collection.outcome_columns,
-                                                 zip(self.dataset_collection.outcome_types,
-                                                     dim_list)):
-                end_idx = start_idx + dim
-                if otype == 'binary':
-                    pearson_r[outcome_name] = np.nan  # Not meaningful for binary
-                else:
-                    y_true = batch['outputs'][:, :, start_idx:end_idx].cpu().numpy()[mask].flatten()
-                    y_pred = outcome_pred[outcome_name].cpu().numpy()[mask].flatten()
-                    pearson_r[outcome_name], _ = pearsonr(y_true, y_pred)
-                start_idx = end_idx
-        else:
-            # Single outcome - original behavior
-            if hasattr(self.dataset_collection, 'outcome_type') and self.dataset_collection.outcome_type == 'binary':
-                pearson_r = np.nan
-            else:
-                mask = batch['active_entries'].cpu().numpy().astype(bool)
-                # For single outcome with multiple output dimensions, we need to handle the mask properly
-                if batch['outputs'].shape[-1] > 1:
-                    # Multiple output dimensions - need to expand mask
-                    mask_expanded = np.broadcast_to(mask, batch['outputs'].shape)
-                    y_true = batch['outputs'].cpu().numpy()[mask_expanded].flatten()
-                    y_pred = outcome_pred.cpu().numpy()[mask_expanded].flatten()
-                else:
-                    y_true = batch['outputs'].cpu().numpy()[mask].flatten()
-                    y_pred = outcome_pred.cpu().numpy()[mask].flatten()
-                pearson_r, _ = pearsonr(y_true, y_pred)
-
-        # Calculate Pearson correlation coefficient for treatments (average across dimensions)
-        mask_treatments = batch['active_entries'].squeeze(-1).cpu().numpy().astype(bool)
-        treatment_true = batch['current_treatments'].double().cpu().numpy()
-        treatment_pred_np = treatment_pred.cpu().numpy()
         
-        # Simple save before calculating correlations
+        # Calculate treatment correlations if testing
         if self.trainer.testing:
+            mask_treatments = batch['active_entries'].squeeze(-1).cpu().numpy().astype(bool)
+            treatment_true = batch['current_treatments'].double().cpu().numpy()
+            treatment_pred_np = treatment_pred.cpu().numpy()
+            
+            # Save treatment predictions if testing
             import pandas as pd
             from pathlib import Path
             
-            subset_name = self.test_dataloader().dataset.subset_name
             output_dir = Path(__file__).parent.parent.parent / "outputs" / "treatment_predictions"
             output_dir.mkdir(parents=True, exist_ok=True)
             
@@ -1152,164 +1223,208 @@ class BRCausalModel(TimeVaryingCausalModel):
             np.save(output_dir / f"{subset_name}_treatment_pred.npy", treatment_pred_np)
             np.save(output_dir / f"{subset_name}_treatment_mask.npy", mask_treatments)
             logger.info(f"Saved {subset_name} treatment arrays to {output_dir}")
-        
-        treatment_correlations = []
-        for dim in range(treatment_true.shape[-1]):
-            t_true = treatment_true[:, :, dim][mask_treatments].flatten()
-            t_pred = treatment_pred_np[:, :, dim][mask_treatments].flatten()
             
-            # Remove any NaN values
-            valid_mask = ~(np.isnan(t_true) | np.isnan(t_pred))
-            t_true = t_true[valid_mask]
-            t_pred = t_pred[valid_mask]
+            treatment_correlations = []
+            for dim in range(treatment_true.shape[-1]):
+                t_true = treatment_true[:, :, dim][mask_treatments].flatten()
+                t_pred = treatment_pred_np[:, :, dim][mask_treatments].flatten()
+                
+                # Remove any NaN values
+                valid_mask = ~(np.isnan(t_true) | np.isnan(t_pred))
+                t_true = t_true[valid_mask]
+                t_pred = t_pred[valid_mask]
+                
+                if len(t_true) > 1:
+                    r, _ = pearsonr(t_true, t_pred)
+                    treatment_correlations.append(r)
             
-            if len(t_true) > 1:
-                r, _ = pearsonr(t_true, t_pred)
-                treatment_correlations.append(r)
+            avg_treatment_pearson_r = np.nanmean(treatment_correlations) if treatment_correlations else np.nan
+            self.log(f'{self.model_type}_{subset_name}_treatment_pearson_r', avg_treatment_pearson_r, on_epoch=True, on_step=False, sync_dist=True)
         
-        avg_treatment_pearson_r = np.nanmean(treatment_correlations) if treatment_correlations else np.nan
-
-        subset_name = self.test_dataloader().dataset.subset_name
-        self.log(f'{self.model_type}_{subset_name}_loss', loss, on_epoch=True, on_step=False, sync_dist=True)
-        self.log(f'{self.model_type}_{subset_name}_bce_loss', bce_loss, on_epoch=True, on_step=False, sync_dist=True)
-        
-        # Log outcome losses and metrics
-        if isinstance(outcome_pred, dict):
-            # Multiple outcomes - log each separately
-            for outcome_name, (otype, loss_val) in zip(self.dataset_collection.outcome_columns,
-                                                      zip(self.dataset_collection.outcome_types,
-                                                          outcome_losses.values())):
-                masked_loss = (batch['active_entries'] * loss_val).sum() / batch['active_entries'].sum()
-                if otype == 'binary':
-                    self.log(f'{self.model_type}_{subset_name}_{outcome_name}_bce_loss', masked_loss,
-                            on_epoch=True, on_step=False, sync_dist=True)
-                else:
-                    self.log(f'{self.model_type}_{subset_name}_{outcome_name}_mse_loss', masked_loss,
-                            on_epoch=True, on_step=False, sync_dist=True)
-                    self.log(f'{self.model_type}_{subset_name}_{outcome_name}_pearson_r', pearson_r[outcome_name],
-                            on_epoch=True, on_step=False, sync_dist=True)
-            self.log(f'{self.model_type}_{subset_name}_total_outcome_loss', outcome_loss,
-                    on_epoch=True, on_step=False, sync_dist=True)
-        else:
-            # Single outcome - original behavior
-            if hasattr(self.dataset_collection, 'outcome_type') and self.dataset_collection.outcome_type == 'binary':
-                self.log(f'{self.model_type}_{subset_name}_outcome_bce_loss', outcome_loss, on_epoch=True, on_step=False, sync_dist=True)
-            else:
-                self.log(f'{self.model_type}_{subset_name}_mse_loss', outcome_loss, on_epoch=True, on_step=False, sync_dist=True)
-            self.log(f'{self.model_type}_{subset_name}_pearson_r', pearson_r, on_epoch=True, on_step=False, sync_dist=True)
-        self.log(f'{self.model_type}_{subset_name}_treatment_pearson_r', avg_treatment_pearson_r, on_epoch=True, on_step=False, sync_dist=True)
-
-    def validation_step(self, batch, batch_idx):
-        """Validation step to compute metrics during training"""
-        from sklearn.metrics import roc_auc_score, average_precision_score
-        
-        # Get predictions
-        treatment_pred, outcome_pred, _ = self(batch)
-        
-        # Calculate losses (same as training but without gradients)
+        # Calculate losses (same as test_step)
         if isinstance(outcome_pred, dict):
             # Multiple outcomes
-            outcome_losses = {}
-            val_metrics = {}
-            total_loss = 0
+            outcome_losses = {}  # Raw losses
+            masked_outcome_losses = {}  # Masked losses for logging
+            
+            # Determine mask once before processing outcomes
+            if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                # Create mask for last timepoint only
+                last_timepoint_mask = torch.zeros_like(batch['active_entries'])
+                for i, seq_len in enumerate(batch['sequence_lengths']):
+                    last_timepoint_mask[i, seq_len-1, :] = 1.0
+                mask = last_timepoint_mask
+            else:
+                # Use all active timepoints
+                mask = batch['active_entries']
             
             start_idx = 0
             # Get dimension list
             dim_list = self.dim_outcome_list if self.dim_outcome_list is not None else [self.dim_outcome]
             
+            for outcome_name, dim in zip(self.dataset_collection.outcome_columns, dim_list):
+                end_idx = start_idx + dim
+                outcome_target = batch['outputs'][:, :, start_idx:end_idx]
+                outcome_bucket = batch['outputs_bucket'][:, :, start_idx:end_idx]
+                
+                # Calculate raw losses
+                loss = F.binary_cross_entropy_with_logits(outcome_pred[outcome_name], outcome_target, reduction='none')
+                
+                # Bucket loss can only be activated if last_timepoint_only is True
+                if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                    # Get sequence lengths
+                    seq_lengths = batch['sequence_lengths']
+                    batch_size = outcome_bucket.shape[0]
+                    
+                    # Extract event time bucket and indicator from last valid timestep
+                    last_indices = seq_lengths.long() - 1
+                    batch_indices = torch.arange(batch_size, device=outcome_bucket.device)
+                    
+                    # Screen outputs and outputs_bucket by their last timepoint
+                    event_bucket = outcome_bucket[batch_indices, last_indices, 0].long()  # Event time bucket
+                    event_indicator = outcome_target[batch_indices, last_indices, 0]      # Event indicator
+                    
+                    # Derive correct event_indicator: set to 0 if outside defined buckets
+                    num_buckets = bucket_pred[outcome_name].shape[-1]  # Get number of buckets from model
+                    outside_range_mask = event_bucket >= num_buckets
+                    event_indicator = event_indicator * (~outside_range_mask).float()  # Set to 0 if outside range
+
+                    # Extract last timepoint predictions for bucket loss
+                    if bucket_pred[outcome_name] is None:
+                        logger.error(f"bucket_pred[{outcome_name}] is None! Model not properly initialized with num_buckets")
+                        exit()
+                    else:
+                        bucket_pred_last = bucket_pred[outcome_name][batch_indices, last_indices, :]
+                    
+                    focal_gamma = getattr(self.hparams.model.multi, 'focal_gamma', 0.0)
+                    loss_bucket = pc_hazard_loss(
+                        bucket_pred_last, 
+                        event_bucket, 
+                        event_indicator, 
+                        reduction='none',
+                        focal_gamma=focal_gamma
+                    )
+                else:
+                    # Bucket loss not supported for seq2seq mode
+                    loss_bucket = torch.zeros_like(loss)
+                
+                # Store raw losses
+                outcome_losses[outcome_name] = loss
+                outcome_losses[outcome_name + '_bucket'] = loss_bucket
+                
+                # Mask and average the losses
+                masked_loss = (mask * loss).sum() / mask.sum()
+                masked_bucket_loss = (loss_bucket).sum() / len(loss_bucket)
+                
+                # Store masked losses for logging
+                masked_outcome_losses[outcome_name] = masked_loss
+                masked_outcome_losses[outcome_name + '_bucket'] = masked_bucket_loss
+                
+                start_idx = end_idx
+            
+            # Calculate total outcome loss using masked losses
+            total_outcome_loss = 0
+            for outcome_name, masked_loss in masked_outcome_losses.items():
+                weight = self.hparams.dataset.task_weights.get(outcome_name.replace('_bucket', ''), 1.0) if hasattr(self.hparams.dataset, 'task_weights') else 1.0
+                total_outcome_loss = total_outcome_loss + weight * masked_loss
+            outcome_loss = total_outcome_loss
+            
+            # Calculate AUC metrics for binary outcomes
+            # Determine timepoint mask
+            if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                timepoint_mask = torch.zeros_like(batch['active_entries'])
+                for i, seq_len in enumerate(batch['sequence_lengths']):
+                    timepoint_mask[i, seq_len - 1, :] = 1.0
+            else:
+                timepoint_mask = batch['active_entries']
+            
+            mask_np = timepoint_mask.cpu().numpy().astype(bool).flatten()
+            
+            # Log individual outcome metrics
+            start_idx = 0
             for outcome_name, (otype, dim) in zip(self.dataset_collection.outcome_columns,
-                                                 zip(self.dataset_collection.outcome_types,
-                                                     dim_list)):
+                                                 zip(self.dataset_collection.outcome_types, dim_list)):
                 end_idx = start_idx + dim
                 outcome_target = batch['outputs'][:, :, start_idx:end_idx]
                 
                 if otype == 'binary':
-                    loss = F.binary_cross_entropy_with_logits(outcome_pred[outcome_name], outcome_target, reduce=False)
-                    
-                    # Calculate AUC metrics for binary outcomes
-                    mask = batch['active_entries'].cpu().numpy().astype(bool).flatten()
-                    y_true = outcome_target.cpu().numpy().flatten()[mask]
-                    y_pred_logits = outcome_pred[outcome_name].detach().cpu().numpy().flatten()[mask]
+                    y_true = outcome_target.cpu().numpy().flatten()[mask_np]
+                    y_pred_logits = outcome_pred[outcome_name].detach().cpu().numpy().flatten()[mask_np]
                     y_pred_probs = 1 / (1 + np.exp(-y_pred_logits))
+                    
+                    # Bucket predictions - need to handle 3D shape properly
+                    # For bucket AUC, we extract last timepoint and take max probability across buckets
+                    bucket_pred_np = bucket_pred[outcome_name].detach().cpu().numpy()
+                    seq_lengths = batch['sequence_lengths'].cpu().numpy()
+                    batch_indices = np.arange(bucket_pred_np.shape[0])
+                    last_indices = seq_lengths - 1
+                    # Get last timepoint bucket predictions
+                    bucket_pred_last = bucket_pred_np[batch_indices, last_indices, :]
+                    # For bucket metrics, we take max probability across buckets as prediction score
+                    y_bucket_logits = bucket_pred_last.max(axis=1)
+                    y_bucket_probs = 1 / (1 + np.exp(-y_bucket_logits))
+                    # Extract the corresponding y_true for last timepoints only
+                    y_true_bucket = outcome_target.cpu().numpy()[batch_indices, last_indices, 0]
                     
                     if len(np.unique(y_true)) > 1:  # Need both classes for AUC
                         auc_roc = roc_auc_score(y_true, y_pred_probs)
                         auc_pr = average_precision_score(y_true, y_pred_probs)
-                        val_metrics[f'val_{outcome_name}_auc_roc'] = auc_roc
-                        val_metrics[f'val_{outcome_name}_auc_pr'] = auc_pr
-                else:
-                    loss = F.mse_loss(outcome_pred[outcome_name], outcome_target, reduce=False)
-                    
-                    # Calculate R for continuous outcomes
-                    mask = batch['active_entries'].cpu().numpy().astype(bool)
-                    y_true = outcome_target.cpu().numpy()[mask].flatten()
-                    y_pred = outcome_pred[outcome_name].detach().cpu().numpy()[mask].flatten()
-                    if len(y_true) > 1:  # Need at least 2 points for correlation
-                        pearson_r, _ = pearsonr(y_true, y_pred)
-                        val_metrics[f'val_{outcome_name}_r'] = pearson_r
+                        self.log(f'{self.model_type}_{subset_name}_{outcome_name}_auc_roc', auc_roc, on_epoch=True, prog_bar=False, sync_dist=True)
+                        self.log(f'{self.model_type}_{subset_name}_{outcome_name}_auc_pr', auc_pr, on_epoch=True, prog_bar=False, sync_dist=True)
+                        
+                        # Bucket AUC metrics - use last timepoint ground truth
+                        bucket_auc_roc = roc_auc_score(y_true_bucket, y_bucket_probs)
+                        bucket_auc_pr = average_precision_score(y_true_bucket, y_bucket_probs)
+                        self.log(f'{self.model_type}_{subset_name}_{outcome_name}_bucket_auc_roc', bucket_auc_roc, on_epoch=True, prog_bar=False, sync_dist=True)
+                        self.log(f'{self.model_type}_{subset_name}_{outcome_name}_bucket_auc_pr', bucket_auc_pr, on_epoch=True, prog_bar=False, sync_dist=True)
                 
-                outcome_losses[outcome_name] = loss
-                
-                # Check if we should only use last timepoint
-                if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
-                    # Create mask for last timepoint only
-                    last_timepoint_mask = torch.zeros_like(batch['active_entries'])
-                    for i, seq_len in enumerate(batch['sequence_lengths']):
-                        last_timepoint_mask[i, seq_len-1, :] = 1.0
-                    mask = last_timepoint_mask
-                else:
-                    # Use all active timepoints
-                    mask = batch['active_entries']
-                
-                masked_loss = (mask * loss).sum() / mask.sum()
-                val_metrics[f'val_{outcome_name}_loss'] = masked_loss.item() if isinstance(masked_loss, torch.Tensor) else masked_loss
-                total_loss += masked_loss
+                # Log masked losses
+                loss_val = masked_outcome_losses[outcome_name]
+                self.log(f'{self.model_type}_{subset_name}_{outcome_name}_bce_loss', loss_val, on_epoch=True, on_step=False, sync_dist=True)
+                bucket_loss_val = masked_outcome_losses[outcome_name + '_bucket']
+                self.log(f'{self.model_type}_{subset_name}_{outcome_name}_bucket_loss', bucket_loss_val, on_epoch=True, on_step=False, sync_dist=True)
                 
                 start_idx = end_idx
-            
-            # Log all metrics
-            for metric_name, metric_value in val_metrics.items():
-                # Convert to CPU if it's a tensor
-                if isinstance(metric_value, torch.Tensor):
-                    metric_value = metric_value.cpu().item()
-                if not np.isnan(metric_value):  # Only log valid metrics
-                    self.log(metric_name, metric_value, on_epoch=True, prog_bar=False, sync_dist=True)
-            
-            # Log total validation loss
-            total_loss_value = total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss
-            self.log('val_loss', total_loss_value, on_epoch=True, prog_bar=True, sync_dist=True)
+                
+            self.log(f'{self.model_type}_{subset_name}_total_outcome_loss', outcome_loss, on_epoch=True, on_step=False, sync_dist=True)
         else:
-            # Single outcome - original behavior
-            if hasattr(self.dataset_collection, 'outcome_type') and self.dataset_collection.outcome_type == 'binary':
-                loss = F.binary_cross_entropy_with_logits(outcome_pred, batch['outputs'], reduce=False)
+            # Single outcome - simplified like test_step
+            # Calculate raw losses
+            outcome_binary_loss_raw = F.binary_cross_entropy_with_logits(outcome_pred, batch['outputs'], reduction='none')
+            
+            # Bucket loss can only be activated if last_timepoint_only is True
+            if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                # Get sequence lengths
+                seq_lengths = batch['sequence_lengths']
+                batch_size = batch['outputs_bucket'].shape[0]
                 
-                # Calculate AUC metrics
-                mask = batch['active_entries'].cpu().numpy().astype(bool).flatten()
-                y_true = batch['outputs'].cpu().numpy().flatten()[mask]
-                y_pred_logits = outcome_pred.detach().cpu().numpy().flatten()[mask]
-                y_pred_probs = 1 / (1 + np.exp(-y_pred_logits))
+                # Extract event time bucket and indicator from last valid timestep
+                last_indices = seq_lengths.long() - 1
+                batch_indices = torch.arange(batch_size, device=batch['outputs_bucket'].device)
                 
-                if len(np.unique(y_true)) > 1:
-                    auc_roc = roc_auc_score(y_true, y_pred_probs)
-                    auc_pr = average_precision_score(y_true, y_pred_probs)
-                    self.log('val_auc_roc', auc_roc, on_epoch=True, prog_bar=False, sync_dist=True)
-                    self.log('val_auc_pr', auc_pr, on_epoch=True, prog_bar=False, sync_dist=True)
+                # Screen outputs and outputs_bucket by their last timepoint
+                event_bucket = batch['outputs_bucket'][batch_indices, last_indices, 0].long()  # Event time bucket
+                event_indicator = batch['outputs'][batch_indices, last_indices, 0]            # Event indicator
+                
+                # Derive correct event_indicator: set to 0 if outside defined buckets
+                num_buckets = bucket_pred.shape[-1]  # Get number of buckets from model
+                outside_range_mask = event_bucket >= num_buckets
+                event_indicator = event_indicator * (~outside_range_mask).float()  # Set to 0 if outside range
+                
+                # Extract last timepoint predictions for bucket loss
+                bucket_pred_last = bucket_pred[batch_indices, last_indices, :]
+                
+                focal_gamma = getattr(self.hparams.model.multi, 'focal_gamma', 0.0)
+                outcome_bucket_loss_raw = pc_hazard_loss(
+                    bucket_pred_last, 
+                    event_bucket, 
+                    event_indicator, 
+                    reduction='none',
+                    focal_gamma=focal_gamma
+                )
             else:
-                loss = F.mse_loss(outcome_pred, batch['outputs'], reduce=False)
-                
-                # Calculate R
-                mask = batch['active_entries'].cpu().numpy().astype(bool)
-                if batch['outputs'].shape[-1] > 1:
-                    mask_expanded = np.broadcast_to(mask, batch['outputs'].shape)
-                    y_true = batch['outputs'].cpu().numpy()[mask_expanded].flatten()
-                    y_pred = outcome_pred.detach().cpu().numpy()[mask_expanded].flatten()
-                else:
-                    y_true = batch['outputs'].cpu().numpy()[mask].flatten()
-                    y_pred = outcome_pred.detach().cpu().numpy()[mask].flatten()
-                
-                if len(y_true) > 1:
-                    pearson_r, _ = pearsonr(y_true, y_pred)
-                    self.log('val_r', pearson_r, on_epoch=True, prog_bar=False, sync_dist=True)
+                # Bucket loss not supported for seq2seq mode - use zeros
+                outcome_bucket_loss_raw = torch.zeros_like(outcome_binary_loss_raw)
             
             # Check if we should only use last timepoint
             if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
@@ -1322,10 +1437,76 @@ class BRCausalModel(TimeVaryingCausalModel):
                 # Use all active timepoints
                 mask = batch['active_entries']
             
-            # Masked loss
-            outcome_loss = (mask * loss).sum() / mask.sum()
-            outcome_loss_value = outcome_loss.item() if isinstance(outcome_loss, torch.Tensor) else outcome_loss
-            self.log('val_loss', outcome_loss_value, on_epoch=True, prog_bar=True, sync_dist=True)
+            # Mask and average the individual losses
+            outcome_binary_loss = (mask * outcome_binary_loss_raw).sum() / mask.sum()
+            outcome_bucket_loss = (outcome_bucket_loss_raw).sum() / len(outcome_bucket_loss_raw)
+            
+            # Sum the masked losses
+            outcome_loss = outcome_binary_loss + outcome_bucket_loss
+            
+            # Calculate AUC metrics for single binary outcome
+            if hasattr(self.dataset_collection, 'outcome_type') and self.dataset_collection.outcome_type == 'binary':
+                # Determine timepoint mask
+                if hasattr(self.hparams.dataset, 'last_timepoint_only') and self.hparams.dataset.last_timepoint_only:
+                    timepoint_mask = torch.zeros_like(batch['active_entries'])
+                    for i, seq_len in enumerate(batch['sequence_lengths']):
+                        timepoint_mask[i, seq_len - 1, :] = 1.0
+                else:
+                    timepoint_mask = batch['active_entries']
+
+                # Apply timepoint mask
+                mask_np = timepoint_mask.cpu().numpy().astype(bool).flatten()
+                y_true = batch['outputs'].cpu().numpy().flatten()[mask_np]
+                y_pred_logits = outcome_pred.detach().cpu().numpy().flatten()[mask_np]
+                y_pred_probs = 1 / (1 + np.exp(-y_pred_logits))
+                
+                # Bucket predictions - need to handle 3D shape properly for single outcome case
+                if bucket_pred is not None:
+                    bucket_pred_np = bucket_pred.detach().cpu().numpy()
+                    seq_lengths = batch['sequence_lengths'].cpu().numpy()
+                    batch_indices = np.arange(bucket_pred_np.shape[0])
+                    last_indices = seq_lengths - 1
+                    # Get last timepoint bucket predictions
+                    bucket_pred_last = bucket_pred_np[batch_indices, last_indices, :]
+                    # For bucket metrics, we take max probability across buckets as prediction score
+                    y_bucket_logits = bucket_pred_last.max(axis=1)
+                    y_bucket_probs = 1 / (1 + np.exp(-y_bucket_logits))
+                    # Extract the corresponding y_true for last timepoints only
+                    y_true_bucket = batch['outputs'].cpu().numpy()[batch_indices, last_indices, 0]
+                else:
+                    y_bucket_probs = None
+                    y_true_bucket = None
+                
+                if len(np.unique(y_true)) > 1:
+                    auc_roc = roc_auc_score(y_true, y_pred_probs)
+                    auc_pr = average_precision_score(y_true, y_pred_probs)
+                    self.log(f'{self.model_type}_{subset_name}_auc_roc', auc_roc, on_epoch=True, prog_bar=False, sync_dist=True)
+                    self.log(f'{self.model_type}_{subset_name}_auc_pr', auc_pr, on_epoch=True, prog_bar=False, sync_dist=True)
+                    
+                    # Bucket AUC metrics - use last timepoint ground truth
+                    if y_bucket_probs is not None and y_true_bucket is not None:
+                        bucket_auc_roc = roc_auc_score(y_true_bucket, y_bucket_probs)
+                        bucket_auc_pr = average_precision_score(y_true_bucket, y_bucket_probs)
+                        self.log(f'{self.model_type}_{subset_name}_bucket_auc_roc', bucket_auc_roc, on_epoch=True, prog_bar=False, sync_dist=True)
+                        self.log(f'{self.model_type}_{subset_name}_bucket_auc_pr', bucket_auc_pr, on_epoch=True, prog_bar=False, sync_dist=True)
+            
+            self.log(f'{self.model_type}_{subset_name}_outcome_bce_loss', outcome_binary_loss, on_epoch=True, on_step=False, sync_dist=True)
+            self.log(f'{self.model_type}_{subset_name}_outcome_bucket_loss', outcome_bucket_loss, on_epoch=True, on_step=False, sync_dist=True)
+        
+        # Masking for shorter sequences
+        bce_loss = (batch['active_entries'].squeeze(-1) * bce_loss).sum() / batch['active_entries'].sum()
+        loss = bce_loss + outcome_loss
+        
+        self.log(f'{self.model_type}_{subset_name}_loss', loss, on_epoch=True, on_step=False, sync_dist=True)
+        self.log(f'{self.model_type}_{subset_name}_bce_loss', bce_loss, on_epoch=True, on_step=False, sync_dist=True)
+        
+        # Also log as 'val_loss' for early stopping callback when validating
+        if subset_name == 'val':
+            self.log('val_loss', loss, on_epoch=True, on_step=False, prog_bar=True, sync_dist=True)
+    
+    def test_step(self, batch, batch_idx):
+        """Test step - just calls validation_step"""
+        return self.validation_step(batch, batch_idx)
 
     def predict_step(self, batch, batch_idx, dataset_idx=None):
         """
@@ -1333,33 +1514,37 @@ class BRCausalModel(TimeVaryingCausalModel):
         """
         if self.hparams.exp.weights_ema:
             with self.ema_non_treatment.average_parameters():
-                _, outcome_pred, br = self(batch)
+                with self.ema_treatment.average_parameters():
+                    _, outcome_pred, br, bucket_pred = self(batch)
         else:
-            _, outcome_pred, br = self(batch)
+            _, outcome_pred, br, bucket_pred = self(batch)
         
         # Handle dict outcomes
         if isinstance(outcome_pred, dict):
             # Concatenate predictions in the same order as outcome_columns
             outcome_tensors = []
+            bucket_tensors = []
             for outcome_name in self.dataset_collection.outcome_columns:
                 outcome_tensors.append(outcome_pred[outcome_name])
+                bucket_tensors.append(bucket_pred[outcome_name])
             outcome_pred = torch.cat(outcome_tensors, dim=-1)
+            bucket_pred = torch.cat(bucket_tensors, dim=-1)
         
-        return outcome_pred.cpu(), br.cpu()
+        return outcome_pred.cpu(), br.cpu(), bucket_pred.cpu()
 
     def get_representations(self, dataset: Dataset) -> np.array:
         logger.info(f'Balanced representations inference for {dataset.subset_name}.')
         # Creating Dataloader
-        data_loader = DataLoader(dataset, batch_size=self.hparams.dataset.val_batch_size, shuffle=False)
-        _, br = [torch.cat(arrs) for arrs in zip(*self.trainer.predict(self, data_loader))]
+        data_loader = DataLoader(dataset, batch_size=self.hparams.dataset.val_batch_size, shuffle=False, num_workers=2)
+        _, br, _ = [torch.cat(arrs) for arrs in zip(*self.trainer.predict(self, data_loader))]
         return br.numpy()
 
-    def get_predictions(self, dataset: Dataset) -> np.array:
+    def get_predictions(self, dataset: Dataset) -> tuple:
         logger.info(f'Predictions for {dataset.subset_name}.')
         # Creating Dataloader
-        data_loader = DataLoader(dataset, batch_size=self.hparams.dataset.val_batch_size, shuffle=False)
-        outcome_pred, _ = [torch.cat(arrs) for arrs in zip(*self.trainer.predict(self, data_loader))]
-        return outcome_pred.numpy()
+        data_loader = DataLoader(dataset, batch_size=self.hparams.dataset.val_batch_size, shuffle=False, num_workers=2)
+        outcome_pred, _, bucket_pred = [torch.cat(arrs) for arrs in zip(*self.trainer.predict(self, data_loader))]
+        return outcome_pred.numpy(), bucket_pred.numpy()
 
 
 class GradNormCallback(Callback):
@@ -1432,8 +1617,17 @@ class GradNormCallback(Callback):
         # Log task weights
         if hasattr(pl_module, 'task_weights'):
             normalized_weights = F.softmax(pl_module.task_weights, dim=0)
-            for i, (name, weight) in enumerate(zip(pl_module.dataset_collection.outcome_columns, normalized_weights)):
-                pl_module.log(f'gradnorm_weight_{name}', weight.item(), on_epoch=True)
+            
+            # Create task names based on whether we have bucket heads
+            task_names = []
+            for outcome_name in pl_module.dataset_collection.outcome_columns:
+                task_names.append(f"{outcome_name}_binary")
+                if hasattr(pl_module, 'has_bucket_heads') and pl_module.has_bucket_heads:
+                    task_names.append(f"{outcome_name}_bucket")
+            
+            # Log weights for each task
+            for i, (task_name, weight) in enumerate(zip(task_names, normalized_weights)):
+                pl_module.log(f'gradnorm_weight_{task_name}', weight.item(), on_epoch=True)
 
 
 class LossBreakdownCallback(Callback):
@@ -1460,6 +1654,15 @@ class LossBreakdownCallback(Callback):
             bce_loss = metrics[f'{model_type}_train_bce_loss'].item()
             loss_parts.append(f"Treatment BCE: {bce_loss:.4f}")
         
+        # Single outcome model losses
+        if f'{model_type}_train_outcome_bce_loss' in metrics:
+            outcome_loss = metrics[f'{model_type}_train_outcome_bce_loss'].item()
+            loss_parts.append(f"Outcome BCE: {outcome_loss:.4f}")
+            
+        if f'{model_type}_train_outcome_bucket_loss' in metrics:
+            bucket_loss = metrics[f'{model_type}_train_outcome_bucket_loss'].item()
+            loss_parts.append(f"Outcome Bucket BCE: {bucket_loss:.4f}")
+        
         # Individual outcome losses
         if hasattr(pl_module.dataset_collection, 'outcome_columns'):
             loss_parts.append("Outcome Losses:")
@@ -1472,7 +1675,12 @@ class LossBreakdownCallback(Callback):
                     # Show GradNorm weight if available
                     if hasattr(pl_module, 'task_weights'):
                         normalized_weights = F.softmax(pl_module.task_weights, dim=0)
-                        weight_str = f" (gradnorm_weight={normalized_weights[i].item():.3f})"
+                        # Calculate weight index based on whether we have bucket heads
+                        if hasattr(pl_module, 'has_bucket_heads') and pl_module.has_bucket_heads:
+                            weight_idx = i * 2  # Binary weight for this outcome
+                        else:
+                            weight_idx = i
+                        weight_str = f" (gradnorm_weight={normalized_weights[weight_idx].item():.3f})"
                     elif hasattr(pl_module.hparams.dataset, 'task_weights') and outcome_name in pl_module.hparams.dataset.task_weights:
                         weight = pl_module.hparams.dataset.task_weights[outcome_name]
                         weight_str = f" (manual_weight={weight})"
@@ -1485,12 +1693,33 @@ class LossBreakdownCallback(Callback):
                     # Show GradNorm weight if available
                     if hasattr(pl_module, 'task_weights'):
                         normalized_weights = F.softmax(pl_module.task_weights, dim=0)
-                        weight_str = f" (gradnorm_weight={normalized_weights[i].item():.3f})"
+                        # Calculate weight index based on whether we have bucket heads
+                        if hasattr(pl_module, 'has_bucket_heads') and pl_module.has_bucket_heads:
+                            weight_idx = i * 2  # Binary weight for this outcome
+                        else:
+                            weight_idx = i
+                        weight_str = f" (gradnorm_weight={normalized_weights[weight_idx].item():.3f})"
                     elif hasattr(pl_module.hparams.dataset, 'task_weights') and outcome_name in pl_module.hparams.dataset.task_weights:
                         weight = pl_module.hparams.dataset.task_weights[outcome_name]
                         weight_str = f" (manual_weight={weight})"
                     
                     loss_parts.append(f"  - {outcome_name} (BCE): {loss_val:.4f}{weight_str}")
+                    
+                    # Add bucket loss if available
+                    if f'{model_type}_train_{outcome_name}_bucket_loss' in metrics:
+                        bucket_loss_val = metrics[f'{model_type}_train_{outcome_name}_bucket_loss'].item()
+                        
+                        # Get bucket weight if using GradNorm
+                        bucket_weight_str = ""
+                        if hasattr(pl_module, 'task_weights') and hasattr(pl_module, 'has_bucket_heads') and pl_module.has_bucket_heads:
+                            normalized_weights = F.softmax(pl_module.task_weights, dim=0)
+                            bucket_weight_idx = i * 2 + 1  # Bucket weight for this outcome
+                            bucket_weight_str = f" (gradnorm_weight={normalized_weights[bucket_weight_idx].item():.3f})"
+                        elif hasattr(pl_module.hparams.dataset, 'task_weights') and outcome_name in pl_module.hparams.dataset.task_weights:
+                            weight = pl_module.hparams.dataset.task_weights[outcome_name]
+                            bucket_weight_str = f" (manual_weight={weight})"
+                        
+                        loss_parts.append(f"  - {outcome_name}_bucket (BCE): {bucket_loss_val:.4f}{bucket_weight_str}")
         
         # Add validation metrics if available
         val_parts = []
@@ -1524,6 +1753,15 @@ class LossBreakdownCallback(Callback):
                     auc_pr = metrics[f'val_{outcome_name}_auc_pr'].item()
                     outcome_metrics.append(f"AUC-PR={auc_pr:.4f}")
                 
+                # Check for bucket metrics
+                if f'val_{outcome_name}_bucket_auc_roc' in metrics:
+                    bucket_auc_roc = metrics[f'val_{outcome_name}_bucket_auc_roc'].item()
+                    outcome_metrics.append(f"Bucket-AUC-ROC={bucket_auc_roc:.4f}")
+                
+                if f'val_{outcome_name}_bucket_auc_pr' in metrics:
+                    bucket_auc_pr = metrics[f'val_{outcome_name}_bucket_auc_pr'].item()
+                    outcome_metrics.append(f"Bucket-AUC-PR={bucket_auc_pr:.4f}")
+                
                 if outcome_metrics:
                     val_parts.append(f"  - {outcome_name}: {', '.join(outcome_metrics)}")
         
@@ -1539,6 +1777,15 @@ class LossBreakdownCallback(Callback):
         if 'val_auc_pr' in metrics:
             auc_pr = metrics['val_auc_pr'].item()
             val_parts.append(f"Val AUC-PR: {auc_pr:.4f}")
+        
+        # Single outcome bucket metrics (for display only)
+        if 'val_bucket_auc_roc' in metrics:
+            bucket_auc_roc = metrics['val_bucket_auc_roc'].item()
+            val_parts.append(f"Val Bucket AUC-ROC: {bucket_auc_roc:.4f}")
+        
+        if 'val_bucket_auc_pr' in metrics:
+            bucket_auc_pr = metrics['val_bucket_auc_pr'].item()
+            val_parts.append(f"Val Bucket AUC-PR: {bucket_auc_pr:.4f}")
         
         # Print the breakdown
         if loss_parts or val_parts:

@@ -59,7 +59,7 @@ class SyntheticDatasetCollection:
         r_train_f = encoder.get_representations(self.train_f)
         r_val_f = encoder.get_representations(self.val_f)
         r_test_cf_treatment_seq = encoder.get_representations(self.test_cf_treatment_seq)
-        outputs_test_cf_treatment_seq = encoder.get_predictions(self.test_cf_treatment_seq)
+        outputs_test_cf_treatment_seq, _ = encoder.get_predictions(self.test_cf_treatment_seq)
 
         # Splitting time series wrt specified projection horizon / Preparing test sequences
         self.train_f.process_sequential(r_train_f, self.projection_horizon, save_encoder_r=save_encoder_r)
@@ -157,7 +157,7 @@ class RealDatasetCollection:
         r_train_f = encoder.get_representations(self.train_f)
         r_val_f = encoder.get_representations(self.val_f)
         r_test_f = encoder.get_representations(self.test_f)
-        outputs_test_f = encoder.get_predictions(self.test_f)
+        outputs_test_f, _ = encoder.get_predictions(self.test_f)
 
         # Splitting time series wrt specified projection horizon / Preparing test sequences
         self.train_f.process_sequential(r_train_f, self.projection_horizon, save_encoder_r=save_encoder_r)

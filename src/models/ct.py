@@ -62,17 +62,18 @@ class CT(EDCT):
         assert self.autoregressive  # prev_outcomes are obligatory
 
         self.basic_block_cls = TransformerMultiInputBlock
-        self._init_specific(args.model.multi)
+        self._init_specific(args.model.multi, dataset_collection)
         self.save_hyperparameters(args)
 
-    def _init_specific(self, sub_args: DictConfig):
+    def _init_specific(self, sub_args: DictConfig, dataset_collection=None):
         """
         Initialization of specific sub-network (only multi)
         Args:
             sub_args: sub-network hyperparameters
+            dataset_collection: Dataset collection for getting num_buckets
         """
         try:
-            super(CT, self)._init_specific(sub_args)
+            super(CT, self)._init_specific(sub_args, dataset_collection)
 
             if self.seq_hidden_units is None or self.br_size is None or self.fc_hidden_units is None \
                     or self.dropout_rate is None:
@@ -137,18 +138,24 @@ class CT(EDCT):
         
         treatment_pred = self.br_treatment_outcome_head.build_treatment(br, detach_treatment)
         outcome_pred = self.br_treatment_outcome_head.build_outcome(br, curr_treatments)
+        bucket_pred = self.br_treatment_outcome_head.build_bucket(br, curr_treatments)
         
         # Split predictions if multiple outcomes
         if hasattr(self, 'dim_outcome_list') and self.dim_outcome_list is not None:
             outcome_pred_dict = {}
+            bucket_pred_dict = {}
             start_idx = 0
             for outcome_name, dim in zip(self.dataset_collection.outcome_columns, self.dim_outcome_list):
                 end_idx = start_idx + dim
                 outcome_pred_dict[outcome_name] = outcome_pred[..., start_idx:end_idx]
+                # Bucket predictions should not be split - they represent time buckets, not outcomes
+                # Each outcome gets the full bucket predictions
+                bucket_pred_dict[outcome_name] = bucket_pred
                 start_idx = end_idx
             outcome_pred = outcome_pred_dict
+            bucket_pred = bucket_pred_dict
 
-        return treatment_pred, outcome_pred, br
+        return treatment_pred, outcome_pred, br, bucket_pred
 
     def build_br(self, prev_treatments, vitals, prev_outputs, static_features, active_entries, fixed_split):
 
@@ -204,7 +211,7 @@ class CT(EDCT):
 
         for t in range(self.hparams.dataset.projection_horizon + 1):
             logger.info(f't = {t + 1}')
-            outputs_scaled = self.get_predictions(dataset)
+            outputs_scaled, _ = self.get_predictions(dataset)
 
             for i in range(len(dataset)):
                 split = int(dataset.data['future_past_split'][i])

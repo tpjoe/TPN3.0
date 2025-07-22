@@ -2,7 +2,7 @@
 dataset:
   # Central disease configuration - change this to switch diseases
   # Options: bpd, nec, rop, death, max_chole_TPNEHR (or their dated_ versions)
-  target_disease: rop
+  target_disease: max_chole_TPNEHR
   _target_: src.data.synthetic_neonatal.SyntheticNeonatalDatasetCollection
   name: synthetic_neonatal
   path: data/processed/autoregressive.csv  # Path to the CSV data file
@@ -73,12 +73,16 @@ dataset:
   - ${dataset.target_disease}  # Disease outcome to predict
   outcome_types:
   - binary  # Type of outcome: binary or continuous
+  horizons:
+    - ["1", 1, 15]      # Bucket 0: 0-1 days (immediate risk)
+    - ["2", 16, 30]      # Bucket 0: 0-1 days (immediate risk)
+    - ["3", 31, 10000]      # Bucket 0: 0-1 days (immediate risk)
+    # - ["4", 46, 60]      # Bucket 0: 0-1 days (immediate risk)
+  landmarks: [1, 2, 3, 5, 7, 10]  # Empty list disables landmark filtering
   sequence_id_column: person_id  # Column identifying unique patients
   timestamp_column: days_on_TPN  # Column containing time information
   scaling: standard  # Feature scaling method: standard or minmax
   treatment_type: continuous  # Type of treatment features
-  right_censor: true  # Apply right censoring based on disease date
-  outcome_shift: 0  # Shift outcomes by n timesteps (for next-step prediction)
   last_timepoint_only: true  # Only use last timestep for loss (seq2one vs seq2seq)
   min_length_filter: true  # Filter out sequences shorter than min_seq_length
   one_seq_per_patient_eval: true  # Use one sequence per patient for evaluation
@@ -87,7 +91,7 @@ dataset:
     test: 0.2
   task_weights:
     ${dataset.target_disease}: 1.0  # Weight for this task in multi-task learning
-  use_gradnorm: false  # Enable GradNorm for automatic task weight balancing
+  use_gradnorm: false  # Enable GradNorm for automatic task weight balancing  <--- doesn't work
   gradnorm_alpha: 1.5  # Alpha parameter for GradNorm (controls convergence speed)
   mute_decoder: true  # Zero out autoregressive inputs to prevent data leakage
 model:

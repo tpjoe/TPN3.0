@@ -24,8 +24,8 @@ class MIMIC3RealDataset(Dataset):
                  treatments: pd.DataFrame,
                  outcomes: pd.DataFrame,
                  vitals: pd.DataFrame,
+                 outcomes_bucket: pd.DataFrame,
                  static_features: pd.DataFrame,
-                 outcomes_unscaled: pd.DataFrame,
                  scaling_params: dict,
                  subset_name: str):
         """
@@ -34,7 +34,6 @@ class MIMIC3RealDataset(Dataset):
             outcomes: DataFrame with outcomes; multiindex by (patient_id, timestep)
             vitals: DataFrame with vitals (time-varying covariates); multiindex by (patient_id, timestep)
             static_features: DataFrame with static features
-            outcomes_unscaled: DataFrame with unscaled outcomes; multiindex by (patient_id, timestep)
             scaling_params: Standard normalization scaling parameters
             subset_name: train / val / test
         """
@@ -49,7 +48,7 @@ class MIMIC3RealDataset(Dataset):
         treatments = treatments.unstack(fill_value=np.nan, level=0).stack(future_stack=True).swaplevel(0, 1).sort_index()
         outcomes = outcomes.unstack(fill_value=np.nan, level=0).stack(future_stack=True).swaplevel(0, 1).sort_index()
         vitals = vitals.unstack(fill_value=np.nan, level=0).stack(future_stack=True).swaplevel(0, 1).sort_index()
-        outcomes_unscaled = outcomes_unscaled.unstack(fill_value=np.nan, level=0).stack(future_stack=True).swaplevel(0, 1).sort_index()
+        outcomes_bucket = outcomes_bucket.unstack(fill_value=np.nan, level=0).stack(future_stack=True).swaplevel(0, 1).sort_index()
         active_entries = (~treatments.isna().any(axis=1)).astype(float)
         static_features = static_features.sort_index()
         user_sizes = user_sizes.sort_index()
@@ -58,7 +57,7 @@ class MIMIC3RealDataset(Dataset):
         treatments = treatments.fillna(0.0).values.reshape((len(user_sizes), max(user_sizes), -1)).astype(float)
         outcomes = outcomes.fillna(0.0).values.reshape((len(user_sizes), max(user_sizes), -1))
         vitals = vitals.fillna(0.0).values.reshape((len(user_sizes), max(user_sizes), -1))
-        outcomes_unscaled = outcomes_unscaled.fillna(0.0).values.reshape((len(user_sizes), max(user_sizes), -1))
+        outcomes_bucket = outcomes_bucket.fillna(0.0).values.reshape((len(user_sizes), max(user_sizes), -1))
         active_entries = active_entries.values.reshape((len(user_sizes), max(user_sizes), 1))
         static_features = static_features.values
         user_sizes = user_sizes.values
@@ -72,8 +71,9 @@ class MIMIC3RealDataset(Dataset):
             'static_features': static_features,
             'active_entries': active_entries[:, 1:, :],
             'outputs': outcomes[:, 1:, :],
-            'unscaled_outputs': outcomes_unscaled[:, 1:, :],
+            'outputs_bucket': outcomes_bucket[:, 1:, :],
             'prev_outputs': outcomes[:, :-1, :].copy(),  # Make a copy to avoid aliasing issues
+            'prev_outputs_bucket': outcomes_bucket[:, :-1, :].copy()
         }
 
         self.scaling_params = scaling_params
@@ -98,24 +98,6 @@ class MIMIC3RealDataset(Dataset):
 
     def __len__(self):
         return len(self.data['active_entries'])
-    
-    def _unscale_outputs(self, scaled_outputs):
-        """Helper method to unscale outputs, handling both dict and array scaling params"""
-        output_means = self.scaling_params['output_means']
-        output_stds = self.scaling_params['output_stds']
-        
-        if isinstance(output_means, dict):
-            # Multiple outcomes - unscale each separately
-            unscaled = np.zeros_like(scaled_outputs)
-            start_idx = 0
-            for outcome_name, (mean, std) in zip(output_means.keys(), zip(output_means.values(), output_stds.values())):
-                # Assume single dimension per outcome for now
-                unscaled[..., start_idx] = scaled_outputs[..., start_idx] * std + mean
-                start_idx += 1
-            return unscaled
-        else:
-            # Single outcome - original behavior
-            return scaled_outputs * output_stds + output_means
 
     def create_one_seq_per_patient_for_n_step(self, projection_horizon):
         """
@@ -129,7 +111,9 @@ class MIMIC3RealDataset(Dataset):
         
         # Get original data
         outputs = self.data['outputs']
+        outputs_bucket = self.data['outputs_bucket']
         prev_outputs = self.data['prev_outputs']
+        prev_outputs_bucket = self.data['prev_outputs_bucket']
         sequence_lengths = self.data['sequence_lengths']
         vitals = self.data['vitals']
         next_vitals = self.data['next_vitals']
@@ -156,7 +140,9 @@ class MIMIC3RealDataset(Dataset):
             max_seq_length = outputs.shape[1]
             
             seq_outputs = np.zeros((n_patients, max_seq_length, outputs.shape[-1]))
+            seq_outputs_bucket = np.zeros((n_patients, max_seq_length, outputs_bucket.shape[-1]))
             seq_prev_outputs = np.zeros((n_patients, max_seq_length, prev_outputs.shape[-1]))
+            seq_prev_outputs_bucket = np.zeros((n_patients, max_seq_length, prev_outputs_bucket.shape[-1]))
             seq_vitals = np.zeros((n_patients, max_seq_length, vitals.shape[-1]))
             seq_next_vitals = np.zeros((n_patients, max_seq_length - 1, next_vitals.shape[-1]))
             seq_active_entries = np.zeros((n_patients, max_seq_length, active_entries.shape[-1]))
@@ -179,6 +165,8 @@ class MIMIC3RealDataset(Dataset):
                     # Copy the history portion (for 0-step, this is the full sequence)
                     seq_outputs[idx, :history_length, :] = outputs[patient_idx, :history_length, :]
                     seq_prev_outputs[idx, :history_length, :] = prev_outputs[patient_idx, :history_length, :]
+                    seq_outputs_bucket[idx, :history_length, :] = outputs_bucket[patient_idx, :history_length, :]
+                    seq_prev_outputs_bucket[idx, :history_length, :] = prev_outputs_bucket[patient_idx, :history_length, :]
                     seq_vitals[idx, :history_length, :] = vitals[patient_idx, :history_length, :]
                     seq_next_vitals[idx, :min(history_length, seq_len-1), :] = next_vitals[patient_idx, :min(history_length, seq_len-1), :]
                     seq_active_entries[idx, :history_length, :] = active_entries[patient_idx, :history_length, :]
@@ -191,6 +179,8 @@ class MIMIC3RealDataset(Dataset):
             n_step_data = {
                 'outputs': seq_outputs,
                 'prev_outputs': seq_prev_outputs,
+                'outputs_bucket': seq_outputs_bucket,
+                'prev_outputs_bucket': seq_prev_outputs_bucket,
                 'vitals': seq_vitals,
                 'next_vitals': seq_next_vitals,
                 'active_entries': seq_active_entries,
@@ -198,7 +188,6 @@ class MIMIC3RealDataset(Dataset):
                 'prev_treatments': seq_previous_treatments,
                 'static_features': seq_static_features,
                 'sequence_lengths': seq_sequence_lengths,
-                'unscaled_outputs': seq_outputs * self.scaling_params['output_stds'] + self.scaling_params['output_means'],
                 'n_step': n_step,  # Track which n-step this is for
                 'true_future_outputs': outputs[valid_indices],  # Keep full sequences for evaluation
                 'original_patient_idx': valid_indices,  # Track original patient indices
@@ -235,6 +224,8 @@ class MIMIC3RealDataset(Dataset):
 
         outputs = self.data['outputs']
         prev_outputs = self.data['prev_outputs']
+        outputs_bucket = self.data['outputs_bucket']
+        prev_outputs_bucket = self.data['prev_outputs_bucket']
         sequence_lengths = self.data['sequence_lengths']
         vitals = self.data['vitals']
         next_vitals = self.data['next_vitals']
@@ -256,6 +247,8 @@ class MIMIC3RealDataset(Dataset):
             # Apply filter
             outputs = outputs[valid_patients]
             prev_outputs = prev_outputs[valid_patients]
+            outputs_bucket = outputs_bucket[valid_patients]
+            prev_outputs_bucket = prev_outputs_bucket[valid_patients]
             sequence_lengths = sequence_lengths[valid_patients]
             vitals = vitals[valid_patients] if vitals.shape[0] > 0 else vitals
             next_vitals = next_vitals[valid_patients] if next_vitals.shape[0] > 0 else next_vitals
@@ -275,6 +268,8 @@ class MIMIC3RealDataset(Dataset):
         seq2seq_static_features = np.zeros((num_seq2seq_rows, static_features.shape[-1]))
         seq2seq_outputs = np.zeros((num_seq2seq_rows, max_seq_length, outputs.shape[-1]))
         seq2seq_prev_outputs = np.zeros((num_seq2seq_rows, max_seq_length, prev_outputs.shape[-1]))
+        seq2seq_outputs_bucket = np.zeros((num_seq2seq_rows, max_seq_length, outputs_bucket.shape[-1]))
+        seq2seq_prev_outputs_bucket = np.zeros((num_seq2seq_rows, max_seq_length, prev_outputs_bucket.shape[-1]))
         seq2seq_vitals = np.zeros((num_seq2seq_rows, max_seq_length, vitals.shape[-1]))
         seq2seq_next_vitals = np.zeros((num_seq2seq_rows, max_seq_length - 1, next_vitals.shape[-1]))
         seq2seq_active_entries = np.zeros((num_seq2seq_rows, max_seq_length, active_entries.shape[-1]))
@@ -295,6 +290,8 @@ class MIMIC3RealDataset(Dataset):
                 seq2seq_current_treatments[total_seq2seq_rows, :(t + 1), :] = current_treatments[i, :(t + 1), :]
                 seq2seq_outputs[total_seq2seq_rows, :(t + 1), :] = outputs[i, :(t + 1), :]
                 seq2seq_prev_outputs[total_seq2seq_rows, :(t + 1), :] = prev_outputs[i, :(t + 1), :]
+                seq2seq_outputs_bucket[total_seq2seq_rows, :(t + 1), :] = outputs_bucket[i, :(t + 1), :]
+                seq2seq_prev_outputs_bucket[total_seq2seq_rows, :(t + 1), :] = prev_outputs_bucket[i, :(t + 1), :]
                 seq2seq_vitals[total_seq2seq_rows, :(t + 1), :] = vitals[i, :(t + 1), :]
                 seq2seq_next_vitals[total_seq2seq_rows, :min(t + 1, sequence_length - 1), :] = \
                     next_vitals[i, :min(t + 1, sequence_length - 1), :]
@@ -309,6 +306,8 @@ class MIMIC3RealDataset(Dataset):
         seq2seq_static_features = seq2seq_static_features[:total_seq2seq_rows, :]
         seq2seq_outputs = seq2seq_outputs[:total_seq2seq_rows, :, :]
         seq2seq_prev_outputs = seq2seq_prev_outputs[:total_seq2seq_rows, :, :]
+        seq2seq_outputs_bucket = seq2seq_outputs_bucket[:total_seq2seq_rows, :, :]
+        seq2seq_prev_outputs_bucket = seq2seq_prev_outputs_bucket[:total_seq2seq_rows, :, :]
         seq2seq_vitals = seq2seq_vitals[:total_seq2seq_rows, :, :]
         seq2seq_next_vitals = seq2seq_next_vitals[:total_seq2seq_rows, :, :]
         seq2seq_active_entries = seq2seq_active_entries[:total_seq2seq_rows, :, :]
@@ -323,9 +322,10 @@ class MIMIC3RealDataset(Dataset):
             'static_features': seq2seq_static_features,
             'prev_outputs': seq2seq_prev_outputs,
             'outputs': seq2seq_outputs,
+            'prev_outputs_bucket': seq2seq_prev_outputs_bucket,
+            'outputs_bucket': seq2seq_outputs_bucket,
             'vitals': seq2seq_vitals,
             'next_vitals': seq2seq_next_vitals,
-            'unscaled_outputs': self._unscale_outputs(seq2seq_outputs),
             'sequence_lengths': seq2seq_sequence_lengths,
             'active_entries': seq2seq_active_entries,
         }
@@ -354,6 +354,8 @@ class MIMIC3RealDataset(Dataset):
 
             outputs = self.data['outputs']
             prev_outputs = self.data['prev_outputs']
+            outputs_bucket = self.data['outputs_bucket']
+            prev_outputs_bucket = self.data['prev_outputs_bucket']
             sequence_lengths = self.data['sequence_lengths']
             active_entries = self.data['active_entries']
             current_treatments = self.data['current_treatments']
@@ -373,6 +375,8 @@ class MIMIC3RealDataset(Dataset):
             seq2seq_static_features = np.zeros((num_seq2seq_rows, static_features.shape[-1]))
             seq2seq_outputs = np.zeros((num_seq2seq_rows, projection_horizon, outputs.shape[-1]))
             seq2seq_prev_outputs = np.zeros((num_seq2seq_rows, projection_horizon, prev_outputs.shape[-1]))
+            seq2seq_outputs_bucket = np.zeros((num_seq2seq_rows, projection_horizon, outputs_bucket.shape[-1]))
+            seq2seq_prev_outputs_bucket = np.zeros((num_seq2seq_rows, projection_horizon, prev_outputs_bucket.shape[-1]))
             seq2seq_active_entries = np.zeros((num_seq2seq_rows, projection_horizon, active_entries.shape[-1]))
             seq2seq_sequence_lengths = np.zeros(num_seq2seq_rows)
             seq2seq_stabilized_weights = np.zeros((num_seq2seq_rows, projection_horizon + 1)) \
@@ -397,13 +401,17 @@ class MIMIC3RealDataset(Dataset):
                     seq2seq_current_treatments[total_seq2seq_rows, :max_projection, :] = \
                         current_treatments[i, t:t + max_projection, :]
                     seq2seq_outputs[total_seq2seq_rows, :max_projection, :] = outputs[i, t:t + max_projection, :]
+                    seq2seq_outputs_bucket[total_seq2seq_rows, :max_projection, :] = outputs_bucket[i, t:t + max_projection, :]
                     seq2seq_sequence_lengths[total_seq2seq_rows] = max_projection
                     seq2seq_static_features[total_seq2seq_rows] = static_features[i]
                     if encoder_outputs is not None:  # For auto-regressive evaluation
                         seq2seq_prev_outputs[total_seq2seq_rows, :max_projection, :] = \
                             encoder_outputs[i, t - 1:t + max_projection - 1, :]
+                        seq2seq_prev_outputs_bucket[total_seq2seq_rows, :max_projection, :] = \
+                            encoder_outputs[i, t - 1:t + max_projection - 1, :]
                     else:  # train / val of decoder
                         seq2seq_prev_outputs[total_seq2seq_rows, :max_projection, :] = prev_outputs[i, t:t + max_projection, :]
+                        seq2seq_prev_outputs_bucket[total_seq2seq_rows, :max_projection, :] = prev_outputs_bucket[i, t:t + max_projection, :]
 
                     if seq2seq_stabilized_weights is not None:  # Also including SW of one-step-ahead prediction
                         seq2seq_stabilized_weights[total_seq2seq_rows, :] = stabilized_weights[i, t - 1:t + max_projection]
@@ -418,7 +426,9 @@ class MIMIC3RealDataset(Dataset):
             seq2seq_current_treatments = seq2seq_current_treatments[:total_seq2seq_rows, :, :]
             seq2seq_static_features = seq2seq_static_features[:total_seq2seq_rows, :]
             seq2seq_outputs = seq2seq_outputs[:total_seq2seq_rows, :, :]
+            seq2seq_outputs_bucket = seq2seq_outputs_bucket[:total_seq2seq_rows, :, :]
             seq2seq_prev_outputs = seq2seq_prev_outputs[:total_seq2seq_rows, :, :]
+            seq2seq_prev_outputs_bucket = seq2seq_prev_outputs_bucket[:total_seq2seq_rows, :, :]
             seq2seq_active_entries = seq2seq_active_entries[:total_seq2seq_rows, :, :]
             seq2seq_sequence_lengths = seq2seq_sequence_lengths[:total_seq2seq_rows]
 
@@ -434,8 +444,9 @@ class MIMIC3RealDataset(Dataset):
                 'current_treatments': seq2seq_current_treatments,
                 'static_features': seq2seq_static_features,
                 'prev_outputs': seq2seq_prev_outputs,
+                'prev_outputs_bucket': seq2seq_prev_outputs_bucket,
                 'outputs': seq2seq_outputs,
-                'unscaled_outputs': self._unscale_outputs(seq2seq_outputs),
+                'outputs_bucket': seq2seq_outputs_bucket,
                 'sequence_lengths': seq2seq_sequence_lengths,
                 'active_entries': seq2seq_active_entries,
             }
@@ -518,7 +529,6 @@ class MIMIC3RealDataset(Dataset):
                 'static_features': self.data['static_features'],
                 'prev_outputs': seq2seq_prev_outputs,
                 'outputs': seq2seq_outputs,
-                'unscaled_outputs': self._unscale_outputs(seq2seq_outputs),
                 'sequence_lengths': seq2seq_sequence_lengths,
                 'active_entries': seq2seq_active_entries,
             }
@@ -649,48 +659,39 @@ class MIMIC3RealDatasetCollection(RealDatasetCollection):
         """
         super(MIMIC3RealDatasetCollection, self).__init__()
         self.seed = seed
-        treatments, outcomes, vitals, static_features, outcomes_unscaled, scaling_params = \
+        treatments, outcomes, vitals, static_features, scaling_params = \
             load_mimic3_data_processed(ROOT_PATH + '/' + path, min_seq_length=min_seq_length, max_seq_length=max_seq_length,
                                        max_number=max_number, data_seed=seed, **kwargs)
 
         # Train/val/test random_split
         static_features, static_features_test = train_test_split(static_features, test_size=split['test'], random_state=seed)
-        treatments, outcomes, vitals, outcomes_unscaled, treatments_test, outcomes_test, vitals_test, outcomes_unscaled_test = \
+        treatments, outcomes, vitals, treatments_test, outcomes_test, vitals_test = \
             treatments.loc[static_features.index], \
             outcomes.loc[static_features.index], \
             vitals.loc[static_features.index], \
-            outcomes_unscaled.loc[static_features.index], \
             treatments.loc[static_features_test.index], \
             outcomes.loc[static_features_test.index], \
-            vitals.loc[static_features_test.index], \
-            outcomes_unscaled.loc[static_features_test.index]
+            vitals.loc[static_features_test.index]
 
         if split['val'] > 0.0:
             static_features_train, static_features_val = train_test_split(static_features,
                                                                           test_size=split['val'] / (1 - split['test']),
                                                                           random_state=2 * seed)
-            treatments_train, outcomes_train, vitals_train, outcomes_unscaled_train, treatments_val, outcomes_val, vitals_val, \
-                outcomes_unscaled_val = \
+            treatments_train, outcomes_train, vitals_train, treatments_val, outcomes_val, vitals_val = \
                 treatments.loc[static_features_train.index], \
                 outcomes.loc[static_features_train.index], \
                 vitals.loc[static_features_train.index], \
-                outcomes_unscaled.loc[static_features_train.index], \
                 treatments.loc[static_features_val.index], \
                 outcomes.loc[static_features_val.index], \
-                vitals.loc[static_features_val.index], \
-                outcomes_unscaled.loc[static_features_val.index]
+                vitals.loc[static_features_val.index]
         else:
             static_features_train = static_features
-            treatments_train, outcomes_train, vitals_train, outcomes_unscaled_train = \
-                treatments, outcomes, vitals, outcomes_unscaled
+            treatments_train, outcomes_train, vitals_train = treatments, outcomes, vitals
 
-        self.train_f = MIMIC3RealDataset(treatments_train, outcomes_train, vitals_train, static_features_train,
-                                         outcomes_unscaled_train, scaling_params, 'train')
+        self.train_f = MIMIC3RealDataset(treatments_train, outcomes_train, vitals_train, static_features_train, scaling_params, 'train')
         if split['val'] > 0.0:
-            self.val_f = MIMIC3RealDataset(treatments_val, outcomes_val, vitals_val, static_features_val, outcomes_unscaled_val,
-                                           scaling_params, 'val')
-        self.test_f = MIMIC3RealDataset(treatments_test, outcomes_test, vitals_test, static_features_test, outcomes_unscaled_test,
-                                        scaling_params, 'test')
+            self.val_f = MIMIC3RealDataset(treatments_val, outcomes_val, vitals_val, static_features_val, scaling_params, 'val')
+        self.test_f = MIMIC3RealDataset(treatments_test, outcomes_test, vitals_test, static_features_test, scaling_params, 'test')
 
         self.projection_horizon = projection_horizon
         self.has_vitals = True

@@ -257,7 +257,7 @@ class RMSNEncoder(RMSN):
 
     def training_step(self, batch, batch_ind):
         outcome_pred, _ = self(batch)
-        mse_loss = F.mse_loss(outcome_pred, batch['outputs'], reduce=False)
+        mse_loss = F.mse_loss(outcome_pred, batch['outputs'], reduction='none')
         weighted_mse_loss = mse_loss * batch['sw_tilde_enc'].unsqueeze(-1)
         weighted_mse_loss = (batch['active_entries'] * weighted_mse_loss).sum() / batch['active_entries'].sum()
         self.log(f'{self.model_type}_mse_loss', weighted_mse_loss, on_epoch=True, on_step=False, sync_dist=True)
@@ -337,7 +337,7 @@ class RMSNDecoder(RMSN):
 
     def training_step(self, batch, batch_ind):
         outcome_pred = self(batch)
-        mse_loss = F.mse_loss(outcome_pred, batch['outputs'], reduce=False)
+        mse_loss = F.mse_loss(outcome_pred, batch['outputs'], reduction='none')
         weighted_mse_loss = mse_loss * batch['sw_tilde_dec'].unsqueeze(-1)
         weighted_mse_loss = (batch['active_entries'] * weighted_mse_loss).sum() / batch['active_entries'].sum()
         self.log(f'{self.model_type}_mse_loss', weighted_mse_loss, on_epoch=True, on_step=False, sync_dist=True)

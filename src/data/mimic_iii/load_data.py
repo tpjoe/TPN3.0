@@ -60,7 +60,7 @@ def load_mimic3_data_processed(data_path: str,
     :param max_number: Maximum number of patients in cohort
     :param data_seed: Seed for random cohort patient selection
     :param drop_first: Dropping first class of one-hot-encoded features
-    :return: tuple of DataFrames and params (treatments, outcomes, vitals, static_features, outcomes_unscaled, scaling_params)
+    :return: tuple of DataFrames and params (treatments, outcomes, vitals, static_features, scaling_params)
     """
 
     logger.info(f'Loading MIMIC-III dataset from {data_path}.')
@@ -144,7 +144,6 @@ def load_mimic3_data_processed(data_path: str,
     logger.info(f'Number of patients filtered: {len(filtered_users)}.')
 
     # Global scaling (same as with semi-synthetic)
-    outcomes_unscaled = all_vitals[outcome_list].copy()
     mean = np.mean(all_vitals, axis=0)
     std = np.std(all_vitals, axis=0)
     all_vitals = (all_vitals - mean) / std
@@ -161,7 +160,7 @@ def load_mimic3_data_processed(data_path: str,
     }
 
     h5.close()
-    return treatments, outcomes, vitals, static_features, outcomes_unscaled, scaling_params
+    return treatments, outcomes, vitals, static_features, scaling_params
 
 
 def load_mimic3_data_raw(data_path: str,
@@ -267,5 +266,5 @@ def load_mimic3_data_raw(data_path: str,
 
 if __name__ == "__main__":
     data_path = ROOT_PATH + '/' + 'data/processed/all_hourly_data.h5'
-    treatments, outcomes, vitals, stat_features, outcomes_unscaled, scaling_params = \
+    treatments, outcomes, vitals, stat_features, scaling_params = \
         load_mimic3_data_processed(data_path, min_seq_length=100, max_seq_length=100)

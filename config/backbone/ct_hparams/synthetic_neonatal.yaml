@@ -2,7 +2,7 @@
 model:
   multi:
     optimizer:
-      learning_rate: 0.001
+      learning_rate: 0.0005
     batch_size: 64
     seq_hidden_units: 48  # Should be divisible by num_heads
     br_size: 24
@@ -10,6 +10,7 @@ model:
     dropout_rate: 0.1
     num_layer: 1
     num_heads: 2
+    focal_gamma: 0.0  # Focal loss gamma for survival loss (0=disabled, try 0.5-2.0 for imbalanced data)
     
     self_positional_encoding:
       max_relative_position: 20
