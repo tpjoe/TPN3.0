@@ -1,0 +1,4 @@
+[2025-07-22 17:36:13,808][__main__][INFO] - Muting decoder inputs (autoregressive outputs) during training
+[2025-07-22 17:38:08,361][__main__][INFO] - Saved trained model to /Users/tpjoe/Library/CloudStorage/GoogleDrive-phongpreecha@gmail.com/My Drive/Stock Prediction/nalab_work/TPN3.0/outputs/trained_model.pt
+[2025-07-22 17:46:01,370][__main__][INFO] - Muting decoder inputs (autoregressive outputs) during training
+[2025-07-22 17:46:57,881][__main__][INFO] - Saved trained model to /Users/tpjoe/Library/CloudStorage/GoogleDrive-phongpreecha@gmail.com/My Drive/Stock Prediction/nalab_work/TPN3.0/outputs/trained_model.pt

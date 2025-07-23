@@ -79,28 +79,29 @@ def load_synthetic_neonatal_data(data_path: str,
 
     # sliding windows and screen by landmarks
     if landmarks:  # If landmarks are specified
-        # For each patient, only include them in landmarks they've reached
-        dfs_by_landmark = []
+        # Keep a copy of the original data for full sequences
+        df_original = df.copy()
         
-        # Group by person_id to process each patient
-        for person_id, patient_df in df.groupby('person_id'):
-            max_day = patient_df['day_since_birth'].max()
-            
-            # For each landmark this patient has reached
-            for lm in landmarks:
-                if max_day >= lm:
-                    # Include data up to landmark day
-                    patient_lm_df = patient_df.loc[patient_df.day_since_birth <= lm].copy()
-                    patient_lm_df['landmark'] = lm
-                    dfs_by_landmark.append(patient_lm_df)
-            
-            # Add the full sequence only if it's different from existing landmarks
-            if max_day not in landmarks:
-                patient_full_df = patient_df.copy()
-                patient_full_df['landmark'] = max(landmarks) + 1  # Use a value that won't conflict
-                dfs_by_landmark.append(patient_full_df)
+        # Create expanded dataframe with all person-landmark combinations
+        person_max_days = df.groupby('person_id')['day_since_birth'].max()
         
-        df = pd.concat(dfs_by_landmark, ignore_index=True)
+        # Create mask for valid person-landmark pairs
+        valid_pairs = []
+        for lm in landmarks:
+            valid_persons = person_max_days[person_max_days >= lm].index
+            valid_pairs.extend([(p, lm) for p in valid_persons])
+        
+        # Merge and filter in one go
+        pairs_df = pd.DataFrame(valid_pairs, columns=['person_id', 'landmark'])
+        df_expanded = df.merge(pairs_df, on='person_id')
+        df = df_expanded[df_expanded['day_since_birth'] <= df_expanded['landmark']]
+        
+        # Add full sequences for patients whose max_day is NOT in landmarks
+        beyond_landmarks = person_max_days[~person_max_days.isin(landmarks)].index
+        if len(beyond_landmarks) > 0:
+            full_seq = df_original[df_original['person_id'].isin(beyond_landmarks)].copy()
+            full_seq['landmark'] = max(landmarks) + 1
+            df = pd.concat([df, full_seq], ignore_index=True)
     else:  # No landmarks - just use full sequences
         df['landmark'] = 0  # Single landmark value for all patients
 

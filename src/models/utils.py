@@ -369,6 +369,65 @@ def pc_hazard_loss(hazard_pred, event_time_bucket, event_indicator, reduction='n
         raise ValueError(f"Invalid reduction: {reduction}")
 
 
+def bce_bucket_loss(bucket_pred, event_bucket, event_indicator, reduction='none', focal_gamma=0.0):
+    """
+    BCE loss for bucket predictions with cumulative encoding, averaged per patient.
+    
+    Args:
+        bucket_pred: Predicted bucket probabilities of shape (batch_size, n_buckets)
+                    These should be logits (before sigmoid)
+        event_bucket: Event/censoring time as bucket index (batch_size,)
+                     Values should be 0 to n_buckets-1 for events, n_buckets for censored
+        event_indicator: Binary event indicator (batch_size,)
+                        1 = event occurred, 0 = censored
+        reduction: 'none', 'mean', or 'sum'
+        focal_gamma: Focal loss gamma parameter (not used in BCE, kept for compatibility)
+    
+    Returns:
+        BCE loss averaged per patient
+    """
+    batch_size, n_buckets = bucket_pred.shape
+    
+    # Create cumulative encoding for ground truth
+    ground_truth = torch.zeros_like(bucket_pred)
+    
+    for i in range(batch_size):
+        if event_indicator[i] == 1:  # Event occurred
+            # For events: 0s before event bucket, 1s from event bucket onwards
+            # Example: event at bucket 1 -> [0, 1, 1, 1, ...]
+            if event_bucket[i] < n_buckets:
+                ground_truth[i, int(event_bucket[i]):] = 1
+        else:  # Censored
+            # For censored: all 0s (we don't know when event will occur)
+            # The patient survived all buckets up to censoring time
+            pass  # Already initialized to 0
+    
+    # Apply sigmoid to get probabilities
+    bucket_probs = torch.sigmoid(bucket_pred)
+    
+    # Calculate BCE loss
+    # For stability, we use the manual BCE formula with clipping
+    epsilon = 1e-7
+    bucket_probs = torch.clamp(bucket_probs, epsilon, 1 - epsilon)
+    
+    # BCE loss: -[y*log(p) + (1-y)*log(1-p)]
+    loss_per_bucket = -(ground_truth * torch.log(bucket_probs) + 
+                       (1 - ground_truth) * torch.log(1 - bucket_probs))
+    
+    # Average across buckets for each patient
+    loss_per_patient = loss_per_bucket.mean(dim=1)
+    
+    # Apply reduction
+    if reduction == 'none':
+        return loss_per_patient
+    elif reduction == 'mean':
+        return loss_per_patient.mean()
+    elif reduction == 'sum':
+        return loss_per_patient.sum()
+    else:
+        raise ValueError(f"Invalid reduction: {reduction}")
+
+
 def save_checkpoint_with_ema(model, checkpoint_path, trainer=None, **kwargs):
     """
     Save checkpoint with EMA weights if available.

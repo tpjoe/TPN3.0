@@ -20,7 +20,7 @@ from tqdm import tqdm
 from scipy.stats import pearsonr
 
 from src.data import RealDatasetCollection, SyntheticDatasetCollection
-from src.models.utils import grad_reverse, BRTreatmentOutcomeHead, AlphaRise, bce, pc_hazard_loss
+from src.models.utils import AlphaRise, bce, pc_hazard_loss, bce_bucket_loss
 
 logger = logging.getLogger(__name__)
 ray_constants.FUNCTION_SIZE_ERROR_THRESHOLD = 10**8  # ~ 100Mb
@@ -982,7 +982,7 @@ class BRCausalModel(TimeVaryingCausalModel):
                         bucket_pred_last = bucket_pred[outcome_name][batch_indices, last_indices, :]
 
                         focal_gamma = getattr(self.hparams.model.multi, 'focal_gamma', 0.0)
-                        loss_bucket = pc_hazard_loss(
+                        loss_bucket = bce_bucket_loss(
                             bucket_pred_last, 
                             event_bucket, 
                             event_indicator, 
@@ -1060,7 +1060,7 @@ class BRCausalModel(TimeVaryingCausalModel):
                     bucket_pred_last = bucket_pred[batch_indices, last_indices, :]
                     
                     focal_gamma = getattr(self.hparams.model.multi, 'focal_gamma', 0.0)
-                    outcome_bucket_loss_raw = pc_hazard_loss(
+                    outcome_bucket_loss_raw = bce_bucket_loss(
                         bucket_pred_last, 
                         event_bucket, 
                         event_indicator, 
@@ -1297,7 +1297,7 @@ class BRCausalModel(TimeVaryingCausalModel):
                         bucket_pred_last = bucket_pred[outcome_name][batch_indices, last_indices, :]
                     
                     focal_gamma = getattr(self.hparams.model.multi, 'focal_gamma', 0.0)
-                    loss_bucket = pc_hazard_loss(
+                    loss_bucket = bce_bucket_loss(
                         bucket_pred_last, 
                         event_bucket, 
                         event_indicator, 
@@ -1415,7 +1415,7 @@ class BRCausalModel(TimeVaryingCausalModel):
                 bucket_pred_last = bucket_pred[batch_indices, last_indices, :]
                 
                 focal_gamma = getattr(self.hparams.model.multi, 'focal_gamma', 0.0)
-                outcome_bucket_loss_raw = pc_hazard_loss(
+                outcome_bucket_loss_raw = bce_bucket_loss(
                     bucket_pred_last, 
                     event_bucket, 
                     event_indicator, 

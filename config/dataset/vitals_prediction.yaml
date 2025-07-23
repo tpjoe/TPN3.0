@@ -1,0 +1,170 @@
+# @package _global_
+dataset:
+  _target_: src.data.synthetic_neonatal.SyntheticNeonatalDatasetCollection
+  name: vitals_prediction
+  path: data/processed/autoregressive.csv  # Same data file as synthetic_neonatal
+  seed: ${exp.seed}
+  min_seq_length: 2
+  max_seq_length: 30
+  projection_horizon: 1  # Predict next-day vitals only
+  cf_seq_mode: sliding_treatment
+  val_batch_size: 512
+  treatment_mode: continuous
+  
+  # Vital columns (same as synthetic_neonatal)
+  vital_columns:
+  - Alb_lab_value
+  - Ca_lab_value
+  - Cl_lab_value
+  - CO2_lab_value
+  - Glu_lab_value
+  - K_lab_value
+  - Mg_lab_value
+  - Na_lab_value
+  - PO4_lab_value
+  - BUN_lab_value
+  - Cr_lab_value
+  - Tri_lab_value
+  - ALKP_lab_value
+  - ALT_lab_value
+  - AST_lab_value
+  - CaI_lab_value
+  - day_since_birth
+  - FluidDose
+  - EnteralDose
+  - days_on_TPN
+  - TPNDose
+  - TPNHours
+  - ProtocolName_NEONATAL
+  - LineID_2
+  - FatProduct_SMOFlipid 20%
+  - FatProduct_Intralipid 20%
+  - FatProduct_Omegaven 10%
+  - TodaysWeight
+  
+  # Static columns (same as synthetic_neonatal)
+  static_columns:
+  - gest_age
+  - bw
+  - gender_concept_id_8507
+  - gender_concept_id_8532
+  - race_concept_id_8515
+  - race_concept_id_8516
+  - race_concept_id_8527
+  - race_concept_id_8557
+  - race_concept_id_8657
+  
+  # Treatment columns (same as synthetic_neonatal)
+  treatment_columns:
+  - FatDose
+  - AADose
+  - DexDose
+  - Acetate
+  - Calcium
+  - Copper
+  - Famotidine
+  - Levocar
+  - Magnesium
+  - MVITotal
+  - Phosphate
+  - Potassium
+  - Sodium
+  - Zinc
+  - Chloride
+  - GIR
+  
+  # For vital prediction, we predict selected lab values as outcomes
+  # You can modify this list to include only the vitals you want to predict
+  outcome_columns:
+  - Alb_lab_value
+  - Ca_lab_value
+  - Cl_lab_value
+  - CO2_lab_value
+  - Glu_lab_value
+  - K_lab_value
+  - Mg_lab_value
+  - Na_lab_value
+  - PO4_lab_value
+  - BUN_lab_value
+  - Cr_lab_value
+  - Tri_lab_value
+  - ALKP_lab_value
+  - ALT_lab_value
+  - AST_lab_value
+  - CaI_lab_value
+  
+  # All vitals are continuous values
+  outcome_types:
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  - continuous
+  
+  # No horizons/buckets needed for simple next-day prediction
+  horizons: []
+  landmarks: []
+  
+  sequence_id_column: person_id
+  timestamp_column: days_on_TPN
+  scaling: standard
+  treatment_type: continuous
+  
+  # Key differences for vital prediction:
+  last_timepoint_only: false  # We want seq2seq, not just last timepoint
+  mute_decoder: false  # We want to use previous predictions autoregressively
+  
+  min_length_filter: true
+  one_seq_per_patient_eval: true
+  split:
+    val: 0.2
+    test: 0.2
+    
+  # Task weights for multi-task learning (one weight per outcome)
+  task_weights:
+    Glu_lab_value: 1.0
+    Na_lab_value: 1.0
+    K_lab_value: 1.0
+    Cl_lab_value: 1.0
+    CO2_lab_value: 1.0
+    BUN_lab_value: 1.0
+    Cr_lab_value: 1.0
+    ALKP_lab_value: 1.0
+    ALT_lab_value: 1.0
+    AST_lab_value: 1.0
+    
+  use_gradnorm: false
+  gradnorm_alpha: 1.5
+
+# Model dimension setup
+model:
+  dim_treatments: ???  # Will be set automatically from treatment_columns length
+  dim_vitals: ???      # Will be set automatically from vital_columns length
+  dim_static_features: ???  # Will be set automatically from static_columns length
+  dim_outcomes:        # One dimension per outcome
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+
+exp:
+  unscale_rmse:
+    vitals: true  # Unscale RMSE for interpretability
+  percentage_rmse: false
